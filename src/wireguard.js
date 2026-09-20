@@ -27,7 +27,7 @@ function ensureInstalled(r) {
 }
 
 function ensureConfig(r, wgPort) {
-  fs.mkdirSync("/etc/wireguard", { mode: 0o700 });
+  fs.mkdirSync("/etc/wireguard", { mode: 0o700, recursive: true });
 
   if (!fs.existsSync(WG_KEY_FILE)) {
     fs.writeFileSync(WG_KEY_FILE, run("wg genkey") + "\n", { mode: 0o600 });
@@ -81,11 +81,27 @@ function ensureFirewall(r, wgPort, agentPort) {
   log.ok(`ufw: opened udp/${wgPort} + tcp/${agentPort}`);
 }
 
+// If wg0 was already up before we existed (pre-configured box), its conf may
+// lack our NAT/forward rules — add them idempotently so client traffic routes.
+function ensureNat(r) {
+  const missing = [];
+  for (const rule of [
+    `iptables -C FORWARD -i ${WG_IFACE} -j ACCEPT`,
+    `iptables -C FORWARD -o ${WG_IFACE} -j ACCEPT`,
+    `iptables -t nat -C POSTROUTING -o ${r.wanIf} -j MASQUERADE`,
+  ]) {
+    if (tryRun(rule) === null) missing.push(rule.replace(" -C ", " -A "));
+  }
+  for (const add of missing) tryRun(add);
+  if (missing.length) log.ok(`nat/forward rules added (${missing.length})`);
+}
+
 function ensure(r, { wgPort, agentPort }) {
   ensureInstalled(r);
   ensureConfig(r, wgPort);
   ensureForwarding(r);
   ensureUp(r, wgPort);
+  ensureNat(r);
   ensureFirewall(r, wgPort, agentPort);
 }
 
@@ -187,10 +203,26 @@ function stats() {
 const os_load = () => require("os").loadavg()[0];
 const os_cpus = () => require("os").cpus().length;
 
-function serverPubKey(pubFile) {
-  return fs.existsSync(pubFile)
-    ? fs.readFileSync(pubFile, "utf8").trim()
-    : tryRun(`wg pubkey < ${WG_KEY_FILE}`);
+// Live interface facts — the source of truth when wg0 predates the agent.
+function liveInfo() {
+  const listenPort = parseInt(tryRun(`wg show ${WG_IFACE} listen-port`), 10) || null;
+  const addrRaw = tryRun(`ip -o -4 addr show dev ${WG_IFACE} | awk '{print $4; exit}'`);
+  let subnet = null;
+  if (addrRaw) {
+    const [ip, mask] = addrRaw.split("/");
+    subnet = mask === "24" ? `${ip.split(".").slice(0, 3).join(".")}.0/24` : addrRaw;
+  }
+  return { listenPort, subnet, address: addrRaw };
 }
 
-module.exports = { ensure, addPeer, removePeer, dump, stats, serverPubKey, WG_IFACE, LISTEN_GW: SUBNET_GW };
+// Prefer the live interface's pubkey — a pre-existing wg0 may use a different key.
+function serverPubKey(pubFile) {
+  return (
+    tryRun(`wg show ${WG_IFACE} public-key`) ||
+    (pubFile && fs.existsSync(pubFile)
+      ? fs.readFileSync(pubFile, "utf8").trim()
+      : tryRun(`wg pubkey < ${WG_KEY_FILE}`))
+  );
+}
+
+module.exports = { ensure, addPeer, removePeer, dump, stats, serverPubKey, liveInfo, WG_IFACE, LISTEN_GW: SUBNET_GW };

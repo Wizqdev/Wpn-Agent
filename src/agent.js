@@ -25,6 +25,8 @@ const DIR = process.env.WPN_AGENT_DIR || "/etc/wpn-agent";
 function banner(token, scheme) {
   const ip = preflight.publicIp() || "0.0.0.0";
   const pub = wg.serverPubKey(identity.pubFile(DIR)) || "(none)";
+  const live = wg.liveInfo();
+  const wgPort = live.listenPort || WG_PORT;
   console.log(
     [
       "",
@@ -33,10 +35,10 @@ function banner(token, scheme) {
       `   Agent URL:      ${scheme}://${ip}:${AGENT_PORT}`,
       `   Agent key:      ${token}`,
       `   Server pubkey:  ${pub}`,
-      `   WG endpoint:    ${ip}:${WG_PORT}/udp`,
+      `   WG endpoint:    ${ip}:${wgPort}/udp`,
       "════════════════════════════════════════════════════════════",
       " Add it:  Wpn Admin → Servers → label + URL + key.",
-      " Note:    open udp/" + WG_PORT + " and tcp/" + AGENT_PORT + " in your cloud firewall.",
+      " Note:    open udp/" + wgPort + " and tcp/" + AGENT_PORT + " in your cloud firewall.",
       " Reprint: wpn-agent --print     Service: wpn-agent --install",
       "",
     ].join("\n")
@@ -47,14 +49,17 @@ function routes() {
   return {
     VERSION,
     dir: DIR,
-    "GET /info": async () => ({
-      version: VERSION,
-      publicKey: wg.serverPubKey(identity.pubFile(DIR)),
-      endpoint: `${preflight.publicIp()}:${WG_PORT}`,
-      subnet: "10.66.0.0/24",
-      hostname: os.hostname(),
-      uptime: os.uptime(),
-    }),
+    "GET /info": async () => {
+      const live = wg.liveInfo();
+      return {
+        version: VERSION,
+        publicKey: wg.serverPubKey(identity.pubFile(DIR)),
+        endpoint: `${preflight.publicIp()}:${live.listenPort || WG_PORT}`,
+        subnet: live.subnet || "10.66.0.0/24",
+        hostname: os.hostname(),
+        uptime: os.uptime(),
+      };
+    },
     "GET /stats": async () => wg.stats(),
     "GET /peers": async () => wg.dump().peers,
     "POST /peers": async (body) => wg.addPeer(body.publicKey, body.address),
