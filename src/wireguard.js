@@ -82,18 +82,40 @@ function ensureFirewall(r, wgPort, agentPort) {
 }
 
 // If wg0 was already up before we existed (pre-configured box), its conf may
-// lack our NAT/forward rules — add them idempotently so client traffic routes.
+// lack our NAT/forward rules — add them live AND persist into wg0.conf so a
+// reboot doesn't silently break the tunnel.
 function ensureNat(r) {
+  const fwd = `FORWARD -i ${WG_IFACE} -j ACCEPT`;
+  const fwdOut = `FORWARD -o ${WG_IFACE} -j ACCEPT`;
+  const nat = `POSTROUTING -o ${r.wanIf} -j MASQUERADE`;
+
   const missing = [];
   for (const rule of [
-    `iptables -C FORWARD -i ${WG_IFACE} -j ACCEPT`,
-    `iptables -C FORWARD -o ${WG_IFACE} -j ACCEPT`,
-    `iptables -t nat -C POSTROUTING -o ${r.wanIf} -j MASQUERADE`,
+    `iptables -C ${fwd}`,
+    `iptables -C ${fwdOut}`,
+    `iptables -t nat -C ${nat}`,
   ]) {
     if (tryRun(rule) === null) missing.push(rule.replace(" -C ", " -A "));
   }
   for (const add of missing) tryRun(add);
   if (missing.length) log.ok(`nat/forward rules added (${missing.length})`);
+
+  // persist — only if the conf doesn't already MASQUERADE on PostUp
+  if (fs.existsSync(WG_CONF) && !fs.readFileSync(WG_CONF, "utf8").includes("MASQUERADE")) {
+    let conf = fs.readFileSync(WG_CONF, "utf8");
+    const up = `iptables -A ${fwd}; iptables -A ${fwdOut}; iptables -t nat -A ${nat}`;
+    const down = `iptables -D ${fwd}; iptables -D ${fwdOut}; iptables -t nat -D ${nat}`;
+    if (/^PostUp\s*=/m.test(conf)) {
+      conf = conf.replace(/^(PostUp\s*=.*)$/m, `$1; ${up}`);
+      conf = /^PostDown\s*=/m.test(conf)
+        ? conf.replace(/^(PostDown\s*=.*)$/m, `$1; ${down}`)
+        : conf.replace(/^(PostUp\s*=.*)$/m, `$1\nPostDown = ${down}`);
+    } else {
+      conf = conf.replace(/^(PrivateKey\s*=.*)$/m, `$1\nPostUp = ${up}\nPostDown = ${down}`);
+    }
+    fs.writeFileSync(WG_CONF, conf, { mode: 0o600 });
+    log.ok("nat rules persisted into wg0.conf");
+  }
 }
 
 function ensure(r, { wgPort, agentPort }) {

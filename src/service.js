@@ -12,6 +12,7 @@ function install(agentPort) {
   for (const item of ["src", "bin", "package.json"]) {
     const src = path.join(__dirname, "..", item);
     const dst = path.join(DEST, item);
+    if (src === dst) continue; // already running from /opt — don't self-copy
     fs.rmSync(dst, { recursive: true, force: true });
     fs.cpSync(src, dst, { recursive: true });
   }
@@ -36,7 +37,9 @@ function install(agentPort) {
     ].join("\n")
   );
   run("systemctl daemon-reload");
-  run("systemctl enable --now wpn-agent");
+  run("systemctl enable wpn-agent");
+  // restart (not just start) so upgrades actually swap the running code
+  run("systemctl restart wpn-agent");
   log.ok("installed + started as systemd service 'wpn-agent'");
   log.info("logs:  journalctl -u wpn-agent -f");
 }
