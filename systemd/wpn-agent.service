@@ -1,0 +1,14 @@
+# Reference unit — `wpn-agent --install` writes this itself.
+[Unit]
+Description=Wpn WireGuard node agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=WPN_AGENT_PORT=44664
+ExecStart=/usr/bin/node /opt/wpn-agent/bin/wpn-agent
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
