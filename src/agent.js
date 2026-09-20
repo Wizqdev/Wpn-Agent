@@ -60,7 +60,12 @@ function routes() {
         uptime: os.uptime(),
       };
     },
-    "GET /stats": async () => wg.stats(),
+    "GET /stats": async () => ({
+      ...wg.stats(),
+      version: VERSION,
+      hostname: os.hostname(),
+      uptime: os.uptime(),
+    }),
     "GET /peers": async () => wg.dump().peers,
     "POST /peers": async (body) => wg.addPeer(body.publicKey, body.address),
     "DELETE /peers/:key": async (_b, p) => wg.removePeer(p.key),
