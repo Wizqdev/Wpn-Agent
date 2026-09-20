@@ -225,6 +225,17 @@ function stats() {
 const os_load = () => require("os").loadavg()[0];
 const os_cpus = () => require("os").cpus().length;
 
+// `wg --version` → "wireguard-tools v1.0.20210914 - https://…" — cache it,
+// the tools version doesn't change while the agent is running.
+let _version;
+function version() {
+  if (_version === undefined) {
+    const out = tryRun("wg --version");
+    _version = (out && (out.match(/v[\d.]+/) || [])[0]) || out || null;
+  }
+  return _version;
+}
+
 // Live interface facts — the source of truth when wg0 predates the agent.
 function liveInfo() {
   const listenPort = parseInt(tryRun(`wg show ${WG_IFACE} listen-port`), 10) || null;
@@ -247,4 +258,4 @@ function serverPubKey(pubFile) {
   );
 }
 
-module.exports = { ensure, addPeer, removePeer, dump, stats, serverPubKey, liveInfo, WG_IFACE, LISTEN_GW: SUBNET_GW };
+module.exports = { ensure, addPeer, removePeer, dump, stats, serverPubKey, liveInfo, version, WG_IFACE, LISTEN_GW: SUBNET_GW };

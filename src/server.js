@@ -47,6 +47,9 @@ const authed = (req, token) => {
 };
 
 // routes: { "GET /info": fn, "POST /peers": fn, "DELETE /peers/:key": fn }
+// meta keys (no space): VERSION, dir, public — `public` lists route strings
+// that skip bearer auth (like /health). A route fn gets (body, params, ctx)
+// where ctx = {req, res, url, ip}; returning undefined = "res already written".
 function serve({ port, token, tls, routes }) {
   const handler = async (req, res) => {
     const send = (status, obj) => {
@@ -60,24 +63,34 @@ function serve({ port, token, tls, routes }) {
       if (req.method === "GET" && path === "/health") {
         return send(200, { ok: true, version: routes.VERSION });
       }
-      if (rateLimited(req.socket.remoteAddress)) {
+      const ip = req.socket.remoteAddress;
+      if (rateLimited(ip)) {
         return send(429, { ok: false, error: "rate limited" });
       }
-      if (!authed(req, token)) {
+
+      // public routes (e.g. /speedtest) skip the bearer check
+      const isPublic = (routes.public || []).some((r) => {
+        const i = r.indexOf(" ");
+        return r.slice(0, i) === req.method && match(r.slice(i + 1), path);
+      });
+      if (!isPublic && !authed(req, token)) {
         return send(401, { ok: false, error: "unauthorized" });
       }
 
       for (const [route, fn] of Object.entries(routes)) {
-        if (!route.includes(" ")) continue; // skip VERSION/dir meta keys
+        if (!route.includes(" ")) continue; // skip VERSION/dir/public meta keys
         const [method, pattern] = route.split(" ");
         if (method !== req.method) continue;
         const params = match(pattern, path);
         if (!params) continue;
         const body = method === "POST" ? await readBody(req) : {};
-        return send(200, { ok: true, data: await fn(body, params) });
+        const data = await fn(body, params, { req, res, url, ip });
+        if (data === undefined) return; // route wrote res itself (streaming)
+        return send(200, { ok: true, data });
       }
       return send(404, { ok: false, error: "not found" });
     } catch (e) {
+      if (res.headersSent) return res.end(); // mid-stream failure — can't send JSON
       return send(e.status || 500, { ok: false, error: e.message || String(e) });
     }
   };

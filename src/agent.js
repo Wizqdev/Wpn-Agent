@@ -6,6 +6,7 @@
 //   wpn-agent --uninstall → remove the service
 //   wpn-agent --skip-wg   → API only, don't touch WireGuard (dev smoke)
 
+const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -21,6 +22,30 @@ const VERSION = require("../package.json").version;
 const AGENT_PORT = parseInt(process.env.WPN_AGENT_PORT || "44664", 10);
 const WG_PORT = parseInt(process.env.WPN_WG_PORT || "51820", 10);
 const DIR = process.env.WPN_AGENT_DIR || "/etc/wpn-agent";
+
+const err = (status, message) => Object.assign(new Error(message), { status });
+
+// /speedtest — public bandwidth probe, hard-capped so it can't be abused as
+// an amplifier: 4 requests/minute per IP, max 8MB per request.
+const SPEED_LIMIT = 4;
+const SPEED_DEF = 2 * 1024 * 1024;
+const SPEED_MAX = 8 * 1024 * 1024;
+const speedHits = new Map(); // ip -> {count, reset}
+
+function speedLimited(ip) {
+  const now = Date.now();
+  const e = speedHits.get(ip);
+  if (!e || now > e.reset) {
+    speedHits.set(ip, { count: 1, reset: now + 60000 });
+  } else if (++e.count > SPEED_LIMIT) {
+    return true;
+  }
+  if (speedHits.size > 4096) {
+    // lazy sweep — keep the map bounded on busy hosts
+    for (const [k, v] of speedHits) if (now > v.reset) speedHits.delete(k);
+  }
+  return false;
+}
 
 function banner(token, scheme) {
   const ip = preflight.publicIp() || "0.0.0.0";
@@ -49,6 +74,29 @@ function routes() {
   return {
     VERSION,
     dir: DIR,
+    public: ["GET /speedtest"],
+    "GET /speedtest": async (_b, _p, { req, res, url, ip }) => {
+      if (speedLimited(ip)) throw err(429, "speedtest rate limited");
+      let n = parseInt(url.searchParams.get("bytes") || "", 10);
+      if (!Number.isFinite(n) || n <= 0) n = SPEED_DEF;
+      n = Math.min(n, SPEED_MAX);
+      res.writeHead(200, {
+        "content-type": "application/octet-stream",
+        "content-length": n,
+        "cache-control": "no-store",
+      });
+      let sent = 0;
+      while (sent < n) {
+        if (res.destroyed || req.destroyed) return undefined; // client gone
+        const chunk = crypto.randomBytes(Math.min(65536, n - sent));
+        sent += chunk.length;
+        if (!res.write(chunk)) {
+          await new Promise((r) => res.once("drain", r));
+        }
+      }
+      res.end();
+      return undefined; // response already streamed
+    },
     "GET /info": async () => {
       const live = wg.liveInfo();
       return {
@@ -65,6 +113,11 @@ function routes() {
       version: VERSION,
       hostname: os.hostname(),
       uptime: os.uptime(),
+      cpuCount: os.cpus().length,
+      memTotal: os.totalmem(),
+      memFree: os.freemem(),
+      wgVersion: wg.version(),
+      iface: wg.WG_IFACE,
     }),
     "GET /peers": async () => wg.dump().peers,
     "POST /peers": async (body) => wg.addPeer(body.publicKey, body.address),
