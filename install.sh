@@ -39,6 +39,16 @@ if [[ "$SRC" != /opt/wpn-agent ]]; then
   cp -r "$SRC/src" "$SRC/bin" "$SRC/package.json" /opt/wpn-agent/
 fi
 
+# --- firewall — open control, wireguard, stealth + echo ports ----------------
+if command -v ufw >/dev/null 2>&1; then
+  ufw allow 44664/tcp >/dev/null || true   # control API
+  ufw allow 51820/udp >/dev/null || true   # wireguard
+  ufw allow 443/tcp >/dev/null || true     # stealth relay (wstunnel wss)
+  ufw allow 8443/tcp >/dev/null || true    # stealth fallback port
+  ufw allow 44665/udp >/dev/null || true   # udp echo probe
+  echo "[✓] ufw rules added (control 44664, wg 51820, stealth 443/8443, echo 44665)"
+fi
+
 node /opt/wpn-agent/bin/wpn-agent --install
 echo
 echo "[✓] done. The agent is running — get your URL + key with:"

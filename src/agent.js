@@ -16,12 +16,16 @@ const wg = require("./wireguard");
 const identity = require("./identity");
 const server = require("./server");
 const service = require("./service");
+const stealth = require("./stealth");
+const echo = require("./echo");
 
 const VERSION = require("../package.json").version;
 
 const AGENT_PORT = parseInt(process.env.WPN_AGENT_PORT || "44664", 10);
 const WG_PORT = parseInt(process.env.WPN_WG_PORT || "51820", 10);
 const DIR = process.env.WPN_AGENT_DIR || "/etc/wpn-agent";
+// populated in main() after DIR exists; capabilities/info read it
+let STEALTH = { enabled: false };
 
 const err = (status, message) => Object.assign(new Error(message), { status });
 
@@ -74,6 +78,8 @@ function routes() {
   return {
     VERSION,
     dir: DIR,
+    stealthState: STEALTH,
+    echoPort: echo.port(),
     public: ["GET /speedtest"],
     "GET /speedtest": async (_b, _p, { req, res, url, ip }) => {
       if (speedLimited(ip)) throw err(429, "speedtest rate limited");
@@ -106,6 +112,10 @@ function routes() {
         subnet: live.subnet || "10.66.0.0/24",
         hostname: os.hostname(),
         uptime: os.uptime(),
+        // authed route only — the key never leaves the public surface
+        stealth: STEALTH.enabled
+          ? { enabled: true, port: STEALTH.port, key: STEALTH.key }
+          : { enabled: false },
       };
     },
     "GET /stats": async () => ({
@@ -123,7 +133,11 @@ function routes() {
     "POST /peers": async (body) => wg.addPeer(body.publicKey, body.address),
     "DELETE /peers/:key": async (_b, p) => wg.removePeer(p.key),
     "GET /capabilities": async () => ({
-      stealth: false, // P8 will enable obfuscation
+      stealth: STEALTH.enabled,
+      stealthPort: STEALTH.port ?? null,
+      stealthMode: STEALTH.enabled ? "wss" : null,
+      stealthError: STEALTH.error ?? undefined,
+      echoPort: echo.port(),
       streaming: false,
       version: VERSION,
       wgVersion: wg.version(),
@@ -157,7 +171,7 @@ function routes() {
   };
 }
 
-function main() {
+async function main() {
   const args = process.argv.slice(2);
   const skipWg = args.includes("--skip-wg");
 
@@ -193,6 +207,14 @@ function main() {
   if (args.includes("--install")) {
     return service.install(AGENT_PORT);
   }
+
+  // UDP echo reflector for the client's loss/jitter probe
+  echo.start();
+
+  // Stealth relay — optional; failures degrade to stealth:false, never fatal.
+  STEALTH = await stealth.ensure(DIR, { wgPort: WG_PORT });
+  if (STEALTH.enabled) log.ok(`stealth relay on tcp/${STEALTH.port} (wss)`);
+  else if (STEALTH.error) log.warn(`stealth unavailable: ${STEALTH.error}`);
 
   const scheme = server.serve({ port: AGENT_PORT, token, tls, routes: routes() });
   banner(token, scheme);
