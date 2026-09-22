@@ -122,6 +122,38 @@ function routes() {
     "GET /peers": async () => wg.dump().peers,
     "POST /peers": async (body) => wg.addPeer(body.publicKey, body.address),
     "DELETE /peers/:key": async (_b, p) => wg.removePeer(p.key),
+    "GET /capabilities": async () => ({
+      stealth: false, // P8 will enable obfuscation
+      streaming: false,
+      version: VERSION,
+      wgVersion: wg.version(),
+    }),
+    // POST /update — fast-forward the checkout and restart the service.
+    // Responds BEFORE the restart; the old agent still answers the call.
+    "POST /update": async () => {
+      if (!fs.existsSync(path.join(DIR, ".git"))) {
+        throw err(409, "agent directory is not a git checkout — update manually");
+      }
+      let output = "";
+      try {
+        output = require("child_process")
+          .execFileSync("git", ["-C", DIR, "pull", "--ff-only"], {
+            timeout: 60000,
+            encoding: "utf8",
+          })
+          .trim();
+      } catch (e) {
+        throw err(502, `git pull failed: ${e.message.slice(0, 300)}`);
+      }
+      // restart only where systemd actually runs this service
+      if (process.platform === "linux") {
+        setTimeout(() => {
+          require("child_process")
+            .exec("systemctl restart wpn-agent", () => {});
+        }, 1000).unref();
+      }
+      return { ok: true, from: VERSION, output };
+    },
   };
 }
 

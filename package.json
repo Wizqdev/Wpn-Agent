@@ -1,6 +1,6 @@
 {
   "name": "wpn-agent",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Wpn WireGuard node agent — self-bootstrapping VPN endpoint with an HTTPS control API",
   "private": true,
   "bin": {
