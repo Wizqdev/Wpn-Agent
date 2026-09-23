@@ -130,6 +130,14 @@ function routes() {
       iface: wg.WG_IFACE,
     }),
     "GET /peers": async () => wg.dump().peers,
+    // per-peer cumulative counters for Api-side usage accounting
+    "GET /peers/usage": async () =>
+      wg.dump().peers.map((p) => ({
+        publicKey: p.publicKey,
+        rx: p.rx,
+        tx: p.tx,
+        latestHandshake: p.latestHandshake,
+      })),
     "POST /peers": async (body) => wg.addPeer(body.publicKey, body.address),
     "DELETE /peers/:key": async (_b, p) => wg.removePeer(p.key),
     "GET /capabilities": async () => ({
