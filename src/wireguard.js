@@ -23,10 +23,11 @@ const firewall = require("./firewall");
 // Constants
 // ---------------------------------------------------------------------------
 
-const WG_IFACE    = "wg0";
-const WG_CONF     = "/etc/wireguard/wg0.conf";
+const WG_IFACE    = process.env.WPN_WG_IFACE || "wg0";
+const WG_CONF     = `/etc/wireguard/${WG_IFACE}.conf`;
 const WG_KEY_FILE = "/etc/wireguard/server.key";
-const SUBNET_GW   = "10.66.0.1/24";
+const SUBNET_V4   = process.env.WPN_SUBNET_V4 || "10.66.0.1/24";
+const SUBNET_V6   = process.env.WPN_SUBNET_V6 || "fd00:66::1/64";
 
 /** @type {Record<string, string>} Package-manager → install command. */
 const INSTALLERS = {
@@ -80,7 +81,7 @@ function ensureConfig(r, wgPort) {
       WG_CONF,
       [
         "[Interface]",
-        `Address = ${SUBNET_GW}`,
+        `Address = ${SUBNET_V4}, ${SUBNET_V6}`,
         `ListenPort = ${wgPort}`,
         `PrivateKey = ${priv}`,
         `PostUp = ${up}`,
@@ -172,6 +173,7 @@ async function ensure(r, { wgPort, agentPort }) {
 
 const WG_KEY_RE = /^[A-Za-z0-9+/]{43}=$/;
 const IPV4_RE   = /^\d{1,3}(\.\d{1,3}){3}$/;
+const IPV6_RE   = /^([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$|^([0-9a-fA-F]{1,4}:)*:[0-9a-fA-F]{1,4}$/;
 
 /**
  * Add a peer to the live WireGuard interface and persist it to `wg0.conf`.
@@ -179,19 +181,26 @@ const IPV4_RE   = /^\d{1,3}(\.\d{1,3}){3}$/;
  * breakage.  All conf mutations are serialised through {@link confLock}.
  *
  * @param {string} publicKey - Base64 WireGuard public key.
- * @param {string} address   - IPv4 tunnel address (e.g. `10.66.0.2`).
+ * @param {string} address   - Tunnel address(es), e.g. `10.66.0.2` or `10.66.0.2,fd00:66::2`.
  * @returns {Promise<{ added: true, address: string }>}
  * @throws {Error} On validation failure, IP conflict, or wg command failure.
  */
 async function addPeer(publicKey, address) {
   if (!WG_KEY_RE.test(publicKey)) throw new Error("publicKey must be a base64 WireGuard key");
-  if (!IPV4_RE.test(address))     throw new Error("address must be an IPv4 tunnel address");
+  
+  const addrs = address.split(",").map((a) => a.trim());
+  for (const a of addrs) {
+    if (!IPV4_RE.test(a) && !IPV6_RE.test(a)) {
+      throw new Error(`address ${a} is not a valid IPv4 or IPv6 address`);
+    }
+  }
 
-  // Conflict check — read live state before acquiring the conf lock so we
-  // fail fast without holding it unnecessarily.
+  const allowedIps = addrs.map((a) => (a.includes(":") ? `${a}/128` : `${a}/32`)).join(",");
+
+  // Conflict check
   const { peers } = dump();
   const conflict = peers.find(
-    (p) => p.allowedIps === `${address}/32` && p.publicKey !== publicKey
+    (p) => p.publicKey !== publicKey && addrs.some((a) => p.allowedIps.includes(a))
   );
   if (conflict) {
     throw new Error(
@@ -199,11 +208,11 @@ async function addPeer(publicKey, address) {
     );
   }
 
-  // Apply live — uses execFileSync arg array, no shell involvement.
+  // Apply live
   runBin("wg", [
     "set", WG_IFACE,
     "peer", publicKey,
-    "allowed-ips", `${address}/32`,
+    "allowed-ips", allowedIps,
     "persistent-keepalive", "25",
   ]);
 
@@ -216,7 +225,7 @@ async function addPeer(publicKey, address) {
         `# wpn-peer ${address}\n` +
         `[Peer]\n` +
         `PublicKey = ${publicKey}\n` +
-        `AllowedIPs = ${address}/32\n` +
+        `AllowedIPs = ${allowedIps}\n` +
         `PersistentKeepalive = 25\n` +
         `\n`;
       fs.writeFileSync(WG_CONF, conf, { mode: 0o600 });
@@ -398,9 +407,11 @@ module.exports = {
   liveInfo,
   version,
   WG_IFACE,
-  LISTEN_GW: SUBNET_GW,
+  SUBNET_V4,
+  SUBNET_V6,
   WG_CONF,
   // Exported for testing
   _WG_KEY_RE: WG_KEY_RE,
   _IPV4_RE:   IPV4_RE,
+  _IPV6_RE:   IPV6_RE,
 };

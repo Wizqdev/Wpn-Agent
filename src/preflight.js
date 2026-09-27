@@ -12,6 +12,7 @@
 
 const os = require("os");
 const fs = require("fs");
+const https = require("https");
 const { tryRun } = require("./util");
 
 // ---------------------------------------------------------------------------
@@ -50,23 +51,65 @@ const detectPkgMgr = () => {
 // Public IP — memoised so collect() and banner() share one HTTP round-trip.
 // ---------------------------------------------------------------------------
 
-/** @type {string|null|undefined} `undefined` means not yet fetched. */
-let _publicIp;
+/** @type {Promise<string|null>|undefined} */
+let _publicIpPromise;
 
 /**
- * Probe the host's public IPv4 address.  Result is memoised for the lifetime
- * of the process — the IP never changes while the agent is running.
- *
- * @returns {string|null}
+ * Check if an IPv4 address is in RFC1918 or RFC6598 private space.
+ * @param {string} ip
+ * @returns {boolean}
  */
-const publicIp = () => {
-  if (_publicIp !== undefined) return _publicIp;
-  _publicIp =
-    tryRun("curl -s4 --max-time 5 ifconfig.me") ||
-    tryRun("curl -s4 --max-time 5 icanhazip.com") ||
-    tryRun("hostname -I | awk '{print $1}'") ||
-    null;
-  return _publicIp;
+const isPrivateIp = (ip) => {
+  const parts = ip.split(".").map(Number);
+  if (parts.length !== 4) return false;
+  if (parts[0] === 10) return true;
+  if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
+  if (parts[0] === 192 && parts[1] === 168) return true;
+  if (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) return true;
+  return false;
+};
+
+/**
+ * Fetch public IP using native Node.js https.
+ * @returns {Promise<string|null>}
+ */
+const fetchExternalIp = () =>
+  new Promise((resolve) => {
+    const req = https.get("https://ifconfig.me", { timeout: 3000 }, (res) => {
+      if (res.statusCode !== 200) return resolve(null);
+      let data = "";
+      res.on("data", (chunk) => (data += chunk));
+      res.on("end", () => resolve(data.trim() || null));
+    });
+    req.on("error", () => resolve(null));
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(null);
+    });
+  });
+
+/**
+ * Determine the host's public IPv4 address.
+ * 1. Inspects the active default route interface. If its IP is public, use it.
+ * 2. If it's a private IP (NATed, like EC2/GCP), queries via HTTPS natively.
+ * Memoised for the lifetime of the process.
+ *
+ * @returns {Promise<string|null>}
+ */
+const publicIp = async () => {
+  if (_publicIpPromise !== undefined) return _publicIpPromise;
+
+  _publicIpPromise = (async () => {
+    const localIp = tryRun("ip -4 route get 8.8.8.8 | grep -oP 'src \\K\\S+'");
+    if (localIp && !isPrivateIp(localIp)) return localIp;
+    
+    const extIp = await fetchExternalIp();
+    if (extIp) return extIp;
+
+    return localIp || null; // fallback to whatever local IP we found
+  })();
+
+  return _publicIpPromise;
 };
 
 /**
@@ -105,7 +148,7 @@ function collect({ agentPort, wgPort }) {
     arch:     os.arch(),
     hostname: os.hostname(),
     node:     process.version,
-    ipv4:     publicIp(),
+    ipv4:     await publicIp(),
     wanIf:
       tryRun("ip route show default | awk '/default/ {print $5; exit}'") ||
       "eth0",
@@ -118,7 +161,7 @@ function collect({ agentPort, wgPort }) {
       agentTcp: { port: agentPort, free: portFree(agentPort, "tcp") },
       wgUdp:    { port: wgPort,    free: portFree(wgPort,    "udp") },
     },
-    wgUp: (tryRun("wg show interfaces") || "").split(/\s+/).includes("wg0"),
+    wgUp: (tryRun("wg show interfaces") || "").split(/\s+/).includes(process.env.WPN_WG_IFACE || "wg0"),
   };
 }
 

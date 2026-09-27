@@ -6,11 +6,13 @@
  *  - Applying and verifying live NAT + forwarding rules
  *  - Opening ports via ufw (when present)
  *
+ *
  * Detection order: iptables → nft.
  * If neither is found an error is thrown at bootstrap time (not silently ignored).
  *
- * nftables rules are written into a dedicated `ip wpn` table so they can be
+ * nftables rules are written into a dedicated `inet wpn` table so they can be
  * atomically flushed on PostDown without touching any existing user rules.
+ * `inet` family natively covers both IPv4 and IPv6.
  */
 
 "use strict";
@@ -62,22 +64,22 @@ function confNatRules(wanIf, wgIface) {
     const fwo = `FORWARD -o ${wgIface} -j ACCEPT`;
     const nat = `POSTROUTING -o ${wanIf} -j MASQUERADE`;
     return {
-      up:   `iptables -A ${fwd}; iptables -A ${fwo}; iptables -t nat -A ${nat}`,
-      down: `iptables -D ${fwd}; iptables -D ${fwo}; iptables -t nat -D ${nat}`,
+      up:   `iptables -A ${fwd}; iptables -A ${fwo}; iptables -t nat -A ${nat}; ip6tables -A ${fwd} 2>/dev/null || true; ip6tables -A ${fwo} 2>/dev/null || true; ip6tables -t nat -A ${nat} 2>/dev/null || true`,
+      down: `iptables -D ${fwd}; iptables -D ${fwo}; iptables -t nat -D ${nat}; ip6tables -D ${fwd} 2>/dev/null || true; ip6tables -D ${fwo} 2>/dev/null || true; ip6tables -t nat -D ${nat} 2>/dev/null || true`,
     };
   }
 
-  // nftables: use a dedicated `ip wpn` table so PostDown can flush it atomically.
+  // nftables: use a dedicated `inet wpn` table for dual-stack.
   return {
     up: [
-      `nft add table ip wpn`,
-      `nft add chain ip wpn forward '{ type filter hook forward priority 0; policy accept; }'`,
-      `nft add rule  ip wpn forward iifname "${wgIface}" accept`,
-      `nft add rule  ip wpn forward oifname "${wgIface}" accept`,
-      `nft add chain ip wpn postrouting '{ type nat hook postrouting priority 100; }'`,
-      `nft add rule  ip wpn postrouting oifname "${wanIf}" masquerade`,
+      `nft add table inet wpn`,
+      `nft add chain inet wpn forward '{ type filter hook forward priority 0; policy accept; }'`,
+      `nft add rule  inet wpn forward iifname "${wgIface}" accept`,
+      `nft add rule  inet wpn forward oifname "${wgIface}" accept`,
+      `nft add chain inet wpn postrouting '{ type nat hook postrouting priority 100; }'`,
+      `nft add rule  inet wpn postrouting oifname "${wanIf}" masquerade`,
     ].join("; "),
-    down: `nft delete table ip wpn`,
+    down: `nft delete table inet wpn`,
   };
 }
 
@@ -101,16 +103,19 @@ function ensureLiveNat(wanIf, wgIface) {
       { c: `iptables -C FORWARD -i ${wgIface} -j ACCEPT`,         a: `iptables -A FORWARD -i ${wgIface} -j ACCEPT` },
       { c: `iptables -C FORWARD -o ${wgIface} -j ACCEPT`,         a: `iptables -A FORWARD -o ${wgIface} -j ACCEPT` },
       { c: `iptables -t nat -C POSTROUTING -o ${wanIf} -j MASQUERADE`, a: `iptables -t nat -A POSTROUTING -o ${wanIf} -j MASQUERADE` },
+      { c: `ip6tables -C FORWARD -i ${wgIface} -j ACCEPT`,        a: `ip6tables -A FORWARD -i ${wgIface} -j ACCEPT` },
+      { c: `ip6tables -C FORWARD -o ${wgIface} -j ACCEPT`,        a: `ip6tables -A FORWARD -o ${wgIface} -j ACCEPT` },
+      { c: `ip6tables -t nat -C POSTROUTING -o ${wanIf} -j MASQUERADE`, a: `ip6tables -t nat -A POSTROUTING -o ${wanIf} -j MASQUERADE` },
     ];
     let added = 0;
     for (const { c, a } of checks) {
-      if (tryRun(c) === null) { tryRun(a); added++; }
+      if (tryRun(c) === null) { tryRun(`${a} 2>/dev/null`); added++; }
     }
     return added;
   }
 
   // nftables: check for table existence; build if absent.
-  const tableExists = tryRun("nft list table ip wpn") !== null;
+  const tableExists = tryRun("nft list table inet wpn") !== null;
   if (tableExists) return 0;
 
   const rules = confNatRules(wanIf, wgIface);
@@ -130,7 +135,7 @@ function ensureLiveNat(wanIf, wgIface) {
  * @returns {string} Updated conf content (may be unchanged if already present).
  */
 function patchConfNat(conf, wanIf, wgIface) {
-  const sentinel = backend() === "iptables" ? "MASQUERADE" : "ip wpn";
+  const sentinel = backend() === "iptables" ? "MASQUERADE" : "inet wpn";
   if (conf.includes(sentinel)) return conf; // already patched
 
   const { up, down } = confNatRules(wanIf, wgIface);
