@@ -1,13 +1,8 @@
 /**
  * @fileoverview Wpn node agent — top-level orchestrator.
  *
- * CLI modes
- * ---------
- *   wpn-agent             → preflight, bootstrap WireGuard, serve control API
- *   wpn-agent --print     → re-print Agent URL + key
- *   wpn-agent --install   → copy to /opt/wpn-agent + systemd unit + start
- *   wpn-agent --uninstall → remove the service
- *   wpn-agent --skip-wg   → API only, don't touch WireGuard (dev smoke)
+ * Handles graceful shutdown on SIGTERM/SIGINT, global error boundaries,
+ * and ties together preflight, WireGuard bootstrap, and the API server.
  */
 
 "use strict";
@@ -25,6 +20,7 @@ const server         = require("./server");
 const service        = require("./service");
 const stealth        = require("./stealth");
 const echo           = require("./echo");
+const health         = require("./health");
 
 const VERSION = require("../package.json").version;
 
@@ -36,29 +32,32 @@ const AGENT_PORT = parseInt(process.env.WPN_AGENT_PORT || "44664", 10);
 const WG_PORT    = parseInt(process.env.WPN_WG_PORT    || "51820", 10);
 const DIR        = process.env.WPN_AGENT_DIR || "/etc/wpn-agent";
 
-/** Populated in `main()` after DIR exists; capabilities/info read it. */
 let STEALTH = { enabled: false };
 
 // ---------------------------------------------------------------------------
-// /speedtest — public bandwidth probe
+// Global error boundaries
 // ---------------------------------------------------------------------------
 
-/**
- * Hard-capped so it cannot be abused as a traffic amplifier:
- *   - 4 requests / minute / IP
- *   - max 8 MiB per request
- */
-const SPEED_LIMIT = 4;
-const SPEED_DEF   = 2 * 1_024 * 1_024; // 2 MiB default payload
-const SPEED_MAX   = 8 * 1_024 * 1_024; // 8 MiB hard cap
+process.on("uncaughtException", (err) => {
+  log.err("uncaught exception", { error: err.stack || err.message });
+  process.exit(1);
+});
 
-/** @type {Map<string, {count: number, reset: number}>} */
+process.on("unhandledRejection", (reason) => {
+  log.err("unhandled rejection", { error: reason instanceof Error ? reason.stack : reason });
+  process.exit(1);
+});
+
+// ---------------------------------------------------------------------------
+// Speedtest
+// ---------------------------------------------------------------------------
+
+const SPEED_LIMIT = 4;
+const SPEED_DEF   = 2 * 1_024 * 1_024;
+const SPEED_MAX   = 8 * 1_024 * 1_024;
+
 const speedHits = new Map();
 
-/**
- * @param {string} ip
- * @returns {boolean} `true` if this IP is rate-limited for /speedtest.
- */
 function speedLimited(ip) {
   const now = Date.now();
   const e   = speedHits.get(ip);
@@ -67,7 +66,6 @@ function speedLimited(ip) {
   } else if (++e.count > SPEED_LIMIT) {
     return true;
   }
-  // Lazy sweep — bound the map on busy hosts.
   if (speedHits.size > 4_096) {
     for (const [k, v] of speedHits) if (now > v.reset) speedHits.delete(k);
   }
@@ -78,12 +76,6 @@ function speedLimited(ip) {
 // Banner
 // ---------------------------------------------------------------------------
 
-/**
- * Print the "agent is live" banner to stdout.
- *
- * @param {string} token  - Bearer token.
- * @param {"http"|"https"} scheme
- */
 function banner(token, scheme) {
   const ip     = preflight.publicIp() || "0.0.0.0";
   const pub    = wg.serverPubKey(identity.pubFile(DIR)) || "(none)";
@@ -111,14 +103,6 @@ function banner(token, scheme) {
 // Route table
 // ---------------------------------------------------------------------------
 
-/**
- * Build and return the route map for the control API server.
- *
- * Routes are plain objects keyed as `"METHOD /path"`.
- * Meta keys (no space in key name) carry configuration: VERSION, dir, public.
- *
- * @returns {import("./server").RouteMap}
- */
 function routes() {
   const err = (status, message) => Object.assign(new Error(message), { status });
 
@@ -129,7 +113,6 @@ function routes() {
     echoPort:     echo.port(),
     public:       ["GET /speedtest"],
 
-    // ── /speedtest ────────────────────────────────────────────────────────
     "GET /speedtest": async (_b, _p, { req, res, url, ip }) => {
       if (speedLimited(ip)) throw err(429, "speedtest rate limited");
       let n = parseInt(url.searchParams.get("bytes") || "", 10);
@@ -142,7 +125,7 @@ function routes() {
       });
       let sent = 0;
       while (sent < n) {
-        if (res.destroyed || req.destroyed) return undefined; // client gone
+        if (res.destroyed || req.destroyed) return undefined;
         const chunk = crypto.randomBytes(Math.min(65_536, n - sent));
         sent += chunk.length;
         if (!res.write(chunk)) {
@@ -150,10 +133,9 @@ function routes() {
         }
       }
       res.end();
-      return undefined; // response already streamed
+      return undefined;
     },
 
-    // ── /info ─────────────────────────────────────────────────────────────
     "GET /info": async () => {
       const live = wg.liveInfo();
       return {
@@ -169,7 +151,6 @@ function routes() {
       };
     },
 
-    // ── /stats ────────────────────────────────────────────────────────────
     "GET /stats": async () => ({
       ...wg.stats(),
       version:  VERSION,
@@ -182,7 +163,6 @@ function routes() {
       iface:    wg.WG_IFACE,
     }),
 
-    // ── /peers ────────────────────────────────────────────────────────────
     "GET /peers": async () => wg.dump().peers,
 
     "GET /peers/usage": async () =>
@@ -197,7 +177,6 @@ function routes() {
 
     "DELETE /peers/:key": async (_b, p) => wg.removePeer(p.key),
 
-    // ── /capabilities ─────────────────────────────────────────────────────
     "GET /capabilities": async () => ({
       stealth:      STEALTH.enabled,
       stealthPort:  STEALTH.port ?? null,
@@ -209,9 +188,6 @@ function routes() {
       wgVersion:    wg.version(),
     }),
 
-    // ── /update ───────────────────────────────────────────────────────────
-    // Fast-forward the git checkout and restart the service.
-    // Responds BEFORE the restart; the old agent still answers this call.
     "POST /update": async () => {
       if (!fs.existsSync(path.join(DIR, ".git"))) {
         throw err(409, "agent directory is not a git checkout — update manually");
@@ -225,7 +201,6 @@ function routes() {
       } catch (e) {
         throw err(502, `git pull failed: ${e.message.slice(0, 300)}`);
       }
-      // Restart only where systemd actually runs this service.
       if (process.platform === "linux") {
         setTimeout(() => {
           execFileSync("systemctl", ["restart", "wpn-agent"]);
@@ -240,12 +215,6 @@ function routes() {
 // Entry point
 // ---------------------------------------------------------------------------
 
-/**
- * Main async entry point — parse CLI flags and dispatch to the appropriate
- * mode.
- *
- * @returns {Promise<void>}
- */
 async function main() {
   const args   = process.argv.slice(2);
   const skipWg = args.includes("--skip-wg");
@@ -257,19 +226,21 @@ async function main() {
 
   if (args.includes("--uninstall")) return service.uninstall();
 
+  let stopHealthMonitor = () => {};
+
   if (!skipWg) {
     const report = preflight.collect({ agentPort: AGENT_PORT, wgPort: WG_PORT });
     preflight.report(report);
     if (!report.ports.agentTcp.free) {
       log.warn(`tcp/${AGENT_PORT} is already bound — set WPN_AGENT_PORT to change it`);
     }
-    wg.ensure(report, { wgPort: WG_PORT, agentPort: AGENT_PORT });
+    await wg.ensure(report, { wgPort: WG_PORT, agentPort: AGENT_PORT });
+    stopHealthMonitor = health.start(wg.WG_CONF);
   }
 
   const { tls } = identity.ensure(DIR);
   if (!tls) log.warn("openssl unavailable — agent will serve plain HTTP");
 
-  // Publish the server pubkey where /info can read it.
   try {
     const pub = wg.serverPubKey(identity.pubFile(DIR));
     if (pub) fs.writeFileSync(identity.pubFile(DIR), pub + "\n", { mode: 0o644 });
@@ -280,17 +251,25 @@ async function main() {
   if (args.includes("--print"))   return banner(token, tls ? "https" : "http");
   if (args.includes("--install")) return service.install(AGENT_PORT);
 
-  // UDP echo reflector for the client's loss/jitter probe.
   echo.start();
 
-  // Stealth relay — optional; failures degrade to stealth:false, never fatal.
   STEALTH = await stealth.ensure(DIR, { wgPort: WG_PORT });
   if (STEALTH.enabled)     log.ok(`stealth relay on tcp/${STEALTH.port} (wss)`);
   else if (STEALTH.error)  log.warn(`stealth unavailable: ${STEALTH.error}`);
 
-  const scheme = server.serve({ port: AGENT_PORT, token, tls, routes: routes() });
-  banner(token, scheme);
-  log.ok(`control API listening on :${AGENT_PORT} (${scheme})`);
+  const srv = server.serve({ port: AGENT_PORT, token, tls, routes: routes(), health });
+  banner(token, srv.scheme);
+  log.ok(`control API listening on :${AGENT_PORT} (${srv.scheme})`);
+
+  // Graceful shutdown
+  const shutdown = async (signal) => {
+    log.info(`received ${signal} — draining requests and shutting down...`);
+    stopHealthMonitor();
+    await srv.shutdown();
+    process.exit(0);
+  };
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT",  () => shutdown("SIGINT"));
 }
 
 module.exports = { main };

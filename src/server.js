@@ -1,15 +1,13 @@
 /**
- * @fileoverview Control API HTTP/HTTPS server.
+ * @fileoverview Control API HTTP/HTTPS server with graceful shutdown.
  *
- * Serves HTTPS (self-signed TLS) when certs are available, plain HTTP
- * otherwise.  Every route except `GET /health` requires a valid Bearer token.
+ * In-flight request tracking ensures that on `SIGTERM` the server stops
+ * accepting new connections but lets active requests drain before the process
+ * exits.  The drain timeout is {@link DRAIN_TIMEOUT_MS} (10 seconds).
  *
- * Rate limiting is enforced per source IP (120 authenticated requests/minute).
- * The `public` meta-key on the routes object lists route strings that skip
- * the bearer check (e.g. `"GET /speedtest"`).
- *
- * Public routes still count against the rate-limit bucket so they can't be
- * used to enumerate the API structure from behind DDoS.
+ * Route handlers receive `(body, params, ctx)` where
+ * `ctx = { req, res, url, ip }`.  Returning `undefined` signals that the
+ * handler has already written the response (streaming).
  */
 
 "use strict";
@@ -23,14 +21,11 @@ const identity = require("./identity");
 // Rate limiting
 // ---------------------------------------------------------------------------
 
-/** Maximum authenticated requests per minute per source IP. */
-const RATE_LIMIT = 120;
+const RATE_LIMIT    = 120;      // authed requests / minute / IP
+const RATE_SWEEP_AT = 4_096;    // sweep map when it exceeds this many entries
 
 /** @type {Map<string, {count: number, reset: number}>} */
 const hits = new Map();
-
-/** Sweep the rate-limit map when it exceeds this many entries. */
-const RATE_SWEEP_AT = 4_096;
 
 /**
  * @param {string} ip
@@ -41,7 +36,6 @@ function rateLimited(ip) {
   const e   = hits.get(ip);
   if (!e || now > e.reset) {
     hits.set(ip, { count: 1, reset: now + 60_000 });
-    // Lazy sweep — keep the map bounded.
     if (hits.size > RATE_SWEEP_AT) {
       for (const [k, v] of hits) if (now > v.reset) hits.delete(k);
     }
@@ -55,8 +49,6 @@ function rateLimited(ip) {
 // ---------------------------------------------------------------------------
 
 /**
- * Create a tagged Error with an HTTP status code attached.
- *
  * @param {number} status
  * @param {string} message
  * @returns {Error & {status: number}}
@@ -64,8 +56,8 @@ function rateLimited(ip) {
 const err = (status, message) => Object.assign(new Error(message), { status });
 
 /**
- * Buffer the full request body and parse it as JSON.
- * Destroys the socket if the body exceeds 64 KiB.
+ * Buffer the full request body and parse as JSON.  Destroys the socket if
+ * the body exceeds 64 KiB.
  *
  * @param {import("http").IncomingMessage} req
  * @returns {Promise<object>}
@@ -109,10 +101,8 @@ const authed = (req, token) => {
 /**
  * Match a parameterised route pattern against a URL path.
  *
- * Example: `match("/peers/:key", "/peers/AbC=")` → `{ key: "AbC=" }`
- *
- * @param {string} pattern - Route pattern (e.g. `"/peers/:key"`).
- * @param {string} path    - Request URL path.
+ * @param {string} pattern - e.g. `"/peers/:key"`
+ * @param {string} path    - Request URL path
  * @returns {object|null} Extracted params, or `null` on no match.
  */
 function match(pattern, path) {
@@ -128,38 +118,89 @@ function match(pattern, path) {
 }
 
 // ---------------------------------------------------------------------------
+// Graceful shutdown
+// ---------------------------------------------------------------------------
+
+/** Maximum time (ms) to wait for in-flight requests to drain on SIGTERM. */
+const DRAIN_TIMEOUT_MS = 10_000;
+
+/** Counter of currently active requests. */
+let _inFlight = 0;
+
+/** Set to `true` once the server begins shutting down. */
+let _draining = false;
+
+/** Resolves when in-flight count drops to zero during drain. */
+let _drainResolve = null;
+
+/**
+ * Initiate graceful shutdown.  Stops accepting new connections and waits up to
+ * {@link DRAIN_TIMEOUT_MS} for in-flight requests to complete.
+ *
+ * @param {import("http").Server|import("https").Server} srv
+ * @returns {Promise<void>}
+ */
+function gracefulShutdown(srv) {
+  _draining = true;
+  return new Promise((resolve) => {
+    srv.close(() => resolve()); // stop accepting new connections
+    if (_inFlight === 0) return resolve();
+    _drainResolve = resolve;
+    setTimeout(() => resolve(), DRAIN_TIMEOUT_MS).unref();
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
 
 /**
  * @typedef {object} RouteMap
- * @property {string}   VERSION     - Package version string.
- * @property {string}   dir         - Agent identity directory.
+ * @property {string}   VERSION
+ * @property {string}   dir
  * @property {object}   stealthState
  * @property {number}   echoPort
- * @property {string[]} [public]    - Route strings that skip bearer auth.
- * @property {Function} [*]         - Route handlers keyed as `"METHOD /path"`.
+ * @property {string[]} [public]    Route strings that skip bearer auth.
+ * @property {Function} [*]         Route handlers keyed as `"METHOD /path"`.
+ */
+
+/**
+ * @typedef {{ shutdown: () => Promise<void> }} ServerHandle
  */
 
 /**
  * Create and bind the HTTP/HTTPS control-API server.
  *
- * Route handlers receive `(body, params, ctx)` where
- * `ctx = { req, res, url, ip }`.  Returning `undefined` signals that the
- * handler has already written the response (e.g. streaming).
- *
- * @param {{ port: number, token: string, tls: boolean, routes: RouteMap }} opts
- * @returns {"http"|"https"} The scheme actually in use.
+ * @param {{ port: number, token: string, tls: boolean, routes: RouteMap,
+ *           health?: import('./health') }} opts
+ * @returns {{ scheme: "http"|"https", shutdown: () => Promise<void> }}
  */
-function serve({ port, token, tls, routes }) {
-  // Pre-compute the set of public route specs so /speedtest etc. don't need a
-  // linear scan through the full route map on every request.
+function serve({ port, token, tls, routes, health }) {
   const publicRoutes = routes.public || [];
 
   /** @param {import("http").IncomingMessage} req */
   const handler = async (req, res) => {
+    if (_draining) {
+      res.writeHead(503, { "content-type": "application/json", "connection": "close" });
+      res.end(JSON.stringify({ ok: false, error: "server shutting down" }));
+      return;
+    }
+
+    _inFlight++;
+    res.on("finish", () => {
+      _inFlight--;
+      if (_draining && _inFlight === 0 && _drainResolve) _drainResolve();
+    });
+    res.on("close", () => {
+      // also decrement on aborted connections
+      if (res.writableEnded) return; // already counted by finish
+      _inFlight--;
+      if (_draining && _inFlight === 0 && _drainResolve) _drainResolve();
+    });
+
     /** @param {number} status @param {object} obj */
     const send = (status, obj) => {
+      if (res.headersSent) return;
       res.writeHead(status, { "content-type": "application/json" });
       res.end(JSON.stringify(obj));
     };
@@ -169,8 +210,15 @@ function serve({ port, token, tls, routes }) {
       const path = url.pathname;
 
       // Health check — unauthenticated, not rate-limited.
+      // Surfaces wg0 health so load balancers get an accurate signal.
       if (req.method === "GET" && path === "/health") {
-        return send(200, { ok: true, version: routes.VERSION });
+        const wgHealth = health ? health.status() : null;
+        const isHealthy = !wgHealth || wgHealth.up;
+        return send(isHealthy ? 200 : 503, {
+          ok:      isHealthy,
+          version: routes.VERSION,
+          ...(wgHealth ? { wg: wgHealth } : {}),
+        });
       }
 
       const ip = req.socket.remoteAddress;
@@ -178,7 +226,6 @@ function serve({ port, token, tls, routes }) {
         return send(429, { ok: false, error: "rate limited" });
       }
 
-      // Public routes skip the bearer check.
       const isPublic = publicRoutes.some((r) => {
         const i = r.indexOf(" ");
         return r.slice(0, i) === req.method && match(r.slice(i + 1), path);
@@ -187,22 +234,21 @@ function serve({ port, token, tls, routes }) {
         return send(401, { ok: false, error: "unauthorized" });
       }
 
-      // Dispatch to a registered route handler.
       for (const [route, fn] of Object.entries(routes)) {
-        if (!route.includes(" ")) continue; // skip VERSION/dir/public meta keys
+        if (!route.includes(" ")) continue;
         const [method, pattern] = route.split(" ");
         if (method !== req.method) continue;
         const params = match(pattern, path);
         if (!params) continue;
         const body = method === "POST" ? await readBody(req) : {};
         const data = await fn(body, params, { req, res, url, ip });
-        if (data === undefined) return; // route wrote the response itself (streaming)
+        if (data === undefined) return;
         return send(200, { ok: true, data });
       }
 
       return send(404, { ok: false, error: "not found" });
     } catch (e) {
-      if (res.headersSent) return res.end(); // mid-stream failure
+      if (res.headersSent) return res.end();
       return send(e.status || 500, { ok: false, error: e.message || String(e) });
     }
   };
@@ -215,7 +261,12 @@ function serve({ port, token, tls, routes }) {
     : http.createServer(handler);
 
   srv.listen(port, "0.0.0.0");
-  return tls ? "https" : "http";
+  const scheme = tls ? "https" : "http";
+
+  return {
+    scheme,
+    shutdown: () => gracefulShutdown(srv),
+  };
 }
 
-module.exports = { serve };
+module.exports = { serve, match, rateLimited };

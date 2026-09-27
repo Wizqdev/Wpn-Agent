@@ -2,19 +2,22 @@
  * @fileoverview WireGuard lifecycle — install, `wg0` config, peer management,
  * stats, and interface introspection.
  *
- * All operations here require root; the agent enforces this at startup.
+ * All conf-file mutations go through the {@link confLock} async mutex so
+ * concurrent API requests cannot corrupt `wg0.conf`.  All `wg` and `ip`
+ * binary calls use {@link runBin} (arg arrays, no shell) to eliminate any
+ * injection surface.
  *
- * Module-level imports of `os` are resolved once at load time rather than
- * inside hot-path functions.  The WireGuard version string is cached after the
- * first call to {@link version} since the binary doesn't change while the agent
- * is running.
+ * NAT/forwarding rules are delegated to {@link module:firewall} which handles
+ * both iptables and nftables backends transparently.
  */
 
 "use strict";
 
 const fs = require("fs");
 const os = require("os");
-const { run, tryRun, log } = require("./util");
+const { run, runBin, tryRun, tryRunBin, log } = require("./util");
+const { confLock } = require("./lock");
+const firewall = require("./firewall");
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -66,14 +69,13 @@ function ensureConfig(r, wgPort) {
   fs.mkdirSync("/etc/wireguard", { mode: 0o700, recursive: true });
 
   if (!fs.existsSync(WG_KEY_FILE)) {
-    fs.writeFileSync(WG_KEY_FILE, run("wg genkey") + "\n", { mode: 0o600 });
+    fs.writeFileSync(WG_KEY_FILE, runBin("wg", ["genkey"]) + "\n", { mode: 0o600 });
     log.ok("server keypair generated");
   }
 
   if (!fs.existsSync(WG_CONF)) {
     const priv = fs.readFileSync(WG_KEY_FILE, "utf8").trim();
-    const up   = `iptables -A FORWARD -i ${WG_IFACE} -j ACCEPT; iptables -A FORWARD -o ${WG_IFACE} -j ACCEPT; iptables -t nat -A POSTROUTING -o ${r.wanIf} -j MASQUERADE`;
-    const down = `iptables -D FORWARD -i ${WG_IFACE} -j ACCEPT; iptables -D FORWARD -o ${WG_IFACE} -j ACCEPT; iptables -t nat -D POSTROUTING -o ${r.wanIf} -j MASQUERADE`;
+    const { up, down } = firewall.confNatRules(r.wanIf, WG_IFACE);
     fs.writeFileSync(
       WG_CONF,
       [
@@ -87,12 +89,12 @@ function ensureConfig(r, wgPort) {
       ].join("\n"),
       { mode: 0o600 }
     );
-    log.ok(`wg0.conf written (nat on ${r.wanIf})`);
+    log.ok(`wg0.conf written (nat on ${r.wanIf}, backend: ${firewall.backend()})`);
   }
 }
 
 /**
- * Enable IPv4/IPv6 forwarding and persist it via sysctl.d.
+ * Enable IPv4/IPv6 forwarding and persist via sysctl.d.
  */
 function ensureForwarding() {
   fs.writeFileSync(
@@ -111,7 +113,7 @@ function ensureForwarding() {
 function ensureUp(r) {
   if (r.wgUp) return log.ok("wg0 already up");
   if (r.systemd) {
-    if (tryRun(`systemctl enable --now wg-quick@${WG_IFACE}`) !== null) {
+    if (tryRunBin("systemctl", ["enable", "--now", `wg-quick@${WG_IFACE}`]) !== null) {
       return log.ok("wg0 up via systemd (wg-quick@wg0)");
     }
     log.warn("systemd start failed — falling back to wg-quick");
@@ -121,60 +123,30 @@ function ensureUp(r) {
 }
 
 /**
- * Open the WireGuard and agent ports in ufw if it is available.
+ * Ensure NAT/forwarding rules are live and persisted.
+ * Uses the {@link firewall} module for backend-agnostic rule management.
+ * The conf-file update is performed under the {@link confLock}.
  *
  * @param {object} r - Preflight report.
- * @param {number} wgPort
- * @param {number} agentPort
+ * @returns {Promise<void>}
  */
-function ensureFirewall(r, wgPort, agentPort) {
-  if (!r.ufw) return;
-  tryRun(`ufw allow ${wgPort}/udp`);
-  tryRun(`ufw allow ${agentPort}/tcp`);
-  log.ok(`ufw: opened udp/${wgPort} + tcp/${agentPort}`);
-}
+async function ensureNat(r) {
+  const added = firewall.ensureLiveNat(r.wanIf, WG_IFACE);
+  if (added) log.ok(`nat/forward rules applied (backend: ${firewall.backend()})`);
 
-/**
- * Ensure NAT/forwarding iptables rules are active and persisted into
- * `wg0.conf` (PostUp/PostDown), handling pre-existing WireGuard setups that
- * predate the agent.
- *
- * @param {object} r - Preflight report.
- */
-function ensureNat(r) {
-  const fwd    = `FORWARD -i ${WG_IFACE} -j ACCEPT`;
-  const fwdOut = `FORWARD -o ${WG_IFACE} -j ACCEPT`;
-  const nat    = `POSTROUTING -o ${r.wanIf} -j MASQUERADE`;
-
-  const missing = [];
-  for (const rule of [
-    `iptables -C ${fwd}`,
-    `iptables -C ${fwdOut}`,
-    `iptables -t nat -C ${nat}`,
-  ]) {
-    if (tryRun(rule) === null) missing.push(rule.replace(" -C ", " -A "));
-  }
-  for (const add of missing) tryRun(add);
-  if (missing.length) log.ok(`nat/forward rules added (${missing.length})`);
-
-  // Persist into wg0.conf — only if MASQUERADE is not already there.
-  if (fs.existsSync(WG_CONF) && !fs.readFileSync(WG_CONF, "utf8").includes("MASQUERADE")) {
-    let conf      = fs.readFileSync(WG_CONF, "utf8");
-    const upLine  = `iptables -A ${fwd}; iptables -A ${fwdOut}; iptables -t nat -A ${nat}`;
-    const downLine = `iptables -D ${fwd}; iptables -D ${fwdOut}; iptables -t nat -D ${nat}`;
-    if (/^PostUp\s*=/m.test(conf)) {
-      conf = conf.replace(/^(PostUp\s*=.*)$/m, `$1; ${upLine}`);
-      conf = /^PostDown\s*=/m.test(conf)
-        ? conf.replace(/^(PostDown\s*=.*)$/m, `$1; ${downLine}`)
-        : conf.replace(/^(PostUp\s*=.*)$/m, `$1\nPostDown = ${downLine}`);
-    } else {
-      conf = conf.replace(
-        /^(PrivateKey\s*=.*)$/m,
-        `$1\nPostUp = ${upLine}\nPostDown = ${downLine}`
-      );
+  // Persist — only if the conf doesn't already contain the sentinel.
+  if (fs.existsSync(WG_CONF)) {
+    const release = await confLock.acquire();
+    try {
+      const before = fs.readFileSync(WG_CONF, "utf8");
+      const after  = firewall.patchConfNat(before, r.wanIf, WG_IFACE);
+      if (after !== before) {
+        fs.writeFileSync(WG_CONF, after, { mode: 0o600 });
+        log.ok("nat rules persisted into wg0.conf");
+      }
+    } finally {
+      release();
     }
-    fs.writeFileSync(WG_CONF, conf, { mode: 0o600 });
-    log.ok("nat rules persisted into wg0.conf");
   }
 }
 
@@ -183,14 +155,15 @@ function ensureNat(r) {
  *
  * @param {object} r - Preflight report from `preflight.collect()`.
  * @param {{ wgPort: number, agentPort: number }} opts
+ * @returns {Promise<void>}
  */
-function ensure(r, { wgPort, agentPort }) {
+async function ensure(r, { wgPort, agentPort }) {
   ensureInstalled(r);
   ensureConfig(r, wgPort);
   ensureForwarding();
   ensureUp(r);
-  ensureNat(r);
-  ensureFirewall(r, wgPort, agentPort);
+  await ensureNat(r);
+  firewall.openPorts(r.ufw, wgPort, agentPort);
 }
 
 // ---------------------------------------------------------------------------
@@ -202,67 +175,103 @@ const IPV4_RE   = /^\d{1,3}(\.\d{1,3}){3}$/;
 
 /**
  * Add a peer to the live WireGuard interface and persist it to `wg0.conf`.
+ * Detects IP conflicts before making any changes to avoid silent data-plane
+ * breakage.  All conf mutations are serialised through {@link confLock}.
  *
  * @param {string} publicKey - Base64 WireGuard public key.
  * @param {string} address   - IPv4 tunnel address (e.g. `10.66.0.2`).
- * @returns {{ added: true, address: string }}
+ * @returns {Promise<{ added: true, address: string }>}
+ * @throws {Error} On validation failure, IP conflict, or wg command failure.
  */
-function addPeer(publicKey, address) {
+async function addPeer(publicKey, address) {
   if (!WG_KEY_RE.test(publicKey)) throw new Error("publicKey must be a base64 WireGuard key");
   if (!IPV4_RE.test(address))     throw new Error("address must be an IPv4 tunnel address");
 
-  run(`wg set ${WG_IFACE} peer '${publicKey}' allowed-ips ${address}/32 persistent-keepalive 25`);
-
-  let conf = fs.readFileSync(WG_CONF, "utf8");
-  if (!conf.includes(publicKey)) {
-    conf +=
-      `# wpn-peer ${address}\n` +
-      `[Peer]\n` +
-      `PublicKey = ${publicKey}\n` +
-      `AllowedIPs = ${address}/32\n` +
-      `PersistentKeepalive = 25\n` +
-      `\n`;
-    fs.writeFileSync(WG_CONF, conf, { mode: 0o600 });
+  // Conflict check — read live state before acquiring the conf lock so we
+  // fail fast without holding it unnecessarily.
+  const { peers } = dump();
+  const conflict = peers.find(
+    (p) => p.allowedIps === `${address}/32` && p.publicKey !== publicKey
+  );
+  if (conflict) {
+    throw new Error(
+      `address ${address} is already assigned to peer ${conflict.publicKey.slice(0, 8)}…`
+    );
   }
+
+  // Apply live — uses execFileSync arg array, no shell involvement.
+  runBin("wg", [
+    "set", WG_IFACE,
+    "peer", publicKey,
+    "allowed-ips", `${address}/32`,
+    "persistent-keepalive", "25",
+  ]);
+
+  // Persist under the conf lock.
+  const release = await confLock.acquire();
+  try {
+    let conf = fs.readFileSync(WG_CONF, "utf8");
+    if (!conf.includes(publicKey)) {
+      conf +=
+        `# wpn-peer ${address}\n` +
+        `[Peer]\n` +
+        `PublicKey = ${publicKey}\n` +
+        `AllowedIPs = ${address}/32\n` +
+        `PersistentKeepalive = 25\n` +
+        `\n`;
+      fs.writeFileSync(WG_CONF, conf, { mode: 0o600 });
+    }
+  } finally {
+    release();
+  }
+
   return { added: true, address };
 }
 
 /**
  * Remove a peer from the live WireGuard interface and from `wg0.conf`.
+ * The conf rewrite is serialised through {@link confLock}.
  *
  * @param {string} publicKey - Base64 WireGuard public key.
- * @returns {{ removed: true }}
+ * @returns {Promise<{ removed: true }>}
  */
-function removePeer(publicKey) {
+async function removePeer(publicKey) {
   if (!WG_KEY_RE.test(publicKey)) throw new Error("invalid peer key");
-  tryRun(`wg set ${WG_IFACE} peer '${publicKey}' remove`);
 
-  const lines = fs.readFileSync(WG_CONF, "utf8").split("\n");
-  const out   = [];
-  let skipping = false;
+  // Remove from live interface first (safe to do outside the lock — wg set is atomic).
+  tryRunBin("wg", ["set", WG_IFACE, "peer", publicKey, "remove"]);
 
-  for (const line of lines) {
-    if (line.includes(publicKey)) {
-      // Drop the marker comment + [Peer] header already queued for this block.
-      while (out.length) {
-        const top = out[out.length - 1];
-        if (top.startsWith("# wpn-peer") || top.trim() === "[Peer]") out.pop();
-        else break;
+  const release = await confLock.acquire();
+  try {
+    const lines = fs.readFileSync(WG_CONF, "utf8").split("\n");
+    const out   = [];
+    let skipping = false;
+
+    for (const line of lines) {
+      if (line.includes(publicKey)) {
+        while (out.length) {
+          const top = out[out.length - 1];
+          if (top.startsWith("# wpn-peer") || top.trim() === "[Peer]") out.pop();
+          else break;
+        }
+        skipping = true;
+        continue;
       }
-      skipping = true;
-      continue;
-    }
-    if (skipping) {
-      if (line.trim() === "" || line.trim() === "[Peer]" || line.startsWith("#")) {
-        skipping = false;
-      } else {
-        continue; // AllowedIPs / PersistentKeepalive of the removed peer
+      if (skipping) {
+        if (line.trim() === "" || line.trim() === "[Peer]" || line.startsWith("#")) {
+          skipping = false;
+        } else {
+          continue;
+        }
       }
+      out.push(line);
     }
-    out.push(line);
+
+    fs.writeFileSync(WG_CONF, out.join("\n"), { mode: 0o600 });
+  } finally {
+    release();
   }
 
-  fs.writeFileSync(WG_CONF, out.join("\n"), { mode: 0o600 });
   return { removed: true };
 }
 
@@ -279,7 +288,7 @@ function removePeer(publicKey) {
  * @returns {{ peers: Array<{publicKey:string, endpoint:string|null, allowedIps:string, latestHandshake:number, rx:number, tx:number}> }}
  */
 function dump() {
-  const out = tryRun(`wg show ${WG_IFACE} dump`);
+  const out = tryRunBin("wg", ["show", WG_IFACE, "dump"]);
   if (!out) return { peers: [] };
   const peers = [];
   for (const line of out.split("\n")) {
@@ -299,16 +308,14 @@ function dump() {
 
 /**
  * Return aggregate statistics for the `wg0` interface.
- * Calls {@link dump} once and derives all values from that single snapshot.
+ * Calls {@link dump} once and derives all values in a single pass.
  *
  * @returns {{ peerCount:number, activePeers:number, rxBytes:number, txBytes:number, load:number, peers: object[] }}
  */
 function stats() {
   const { peers } = dump();
   const now       = Math.floor(Date.now() / 1_000);
-  let rxBytes = 0;
-  let txBytes = 0;
-  let activePeers = 0;
+  let rxBytes = 0, txBytes = 0, activePeers = 0;
 
   for (const p of peers) {
     rxBytes += p.rx;
@@ -334,14 +341,14 @@ function stats() {
 let _version;
 
 /**
- * Return the installed `wireguard-tools` version string (e.g. `"v1.0.20210914"`).
- * Result is cached — the binary version doesn't change while the agent runs.
+ * Return the installed `wireguard-tools` version string.
+ * Cached — the binary version doesn't change while the agent runs.
  *
  * @returns {string|null}
  */
 function version() {
   if (_version !== undefined) return _version;
-  const out = tryRun("wg --version");
+  const out = tryRunBin("wg", ["--version"]);
   _version = (out && (out.match(/v[\d.]+/) || [])[0]) || out || null;
   return _version;
 }
@@ -351,13 +358,12 @@ function version() {
 // ---------------------------------------------------------------------------
 
 /**
- * Query live `wg0` state.  This is the source of truth when `wg0` predates
- * the agent.
+ * Query live `wg0` state — the source of truth when `wg0` predates the agent.
  *
  * @returns {{ listenPort: number|null, subnet: string|null, address: string|null }}
  */
 function liveInfo() {
-  const listenPort = parseInt(tryRun(`wg show ${WG_IFACE} listen-port`), 10) || null;
+  const listenPort = parseInt(tryRunBin("wg", ["show", WG_IFACE, "listen-port"]), 10) || null;
   const addrRaw    = tryRun(`ip -o -4 addr show dev ${WG_IFACE} | awk '{print $4; exit}'`);
   let subnet = null;
   if (addrRaw) {
@@ -368,15 +374,14 @@ function liveInfo() {
 }
 
 /**
- * Return the public key of the live `wg0` interface, preferring the runtime
- * value over the cached file (a pre-existing `wg0` may use a different key).
+ * Return the public key of the live `wg0` interface.
  *
  * @param {string} pubFile - Path to the cached public-key file.
  * @returns {string|null}
  */
 function serverPubKey(pubFile) {
   return (
-    tryRun(`wg show ${WG_IFACE} public-key`) ||
+    tryRunBin("wg", ["show", WG_IFACE, "public-key"]) ||
     (pubFile && fs.existsSync(pubFile)
       ? fs.readFileSync(pubFile, "utf8").trim()
       : tryRun(`wg pubkey < ${WG_KEY_FILE}`))
@@ -394,4 +399,8 @@ module.exports = {
   version,
   WG_IFACE,
   LISTEN_GW: SUBNET_GW,
+  WG_CONF,
+  // Exported for testing
+  _WG_KEY_RE: WG_KEY_RE,
+  _IPV4_RE:   IPV4_RE,
 };
