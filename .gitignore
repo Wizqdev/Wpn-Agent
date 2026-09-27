@@ -2,3 +2,16 @@ node_modules/
 *.log
 .env
 data/
+
+# Runtime artifacts written by the agent — never commit these
+/etc/wpn-agent/
+/etc/wireguard/
+
+# macOS
+.DS_Store
+
+# Editor directories / files
+.idea/
+.vscode/
+*.swp
+*.swo

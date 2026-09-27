@@ -7,9 +7,10 @@
     "wpn-agent": "bin/wpn-agent"
   },
   "scripts": {
-    "start": "node bin/wpn-agent",
-    "print": "node bin/wpn-agent --print",
-    "install-service": "node bin/wpn-agent --install"
+    "start":           "node bin/wpn-agent",
+    "print":           "node bin/wpn-agent --print",
+    "install-service": "node bin/wpn-agent --install",
+    "dev":             "node bin/wpn-agent --skip-wg"
   },
   "engines": {
     "node": ">=18"
