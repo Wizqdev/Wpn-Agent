@@ -136,7 +136,7 @@ const portFree = (port, proto) => {
  * @param {{ agentPort: number, wgPort: number }} opts
  * @returns {object} Machine report object.
  */
-function collect({ agentPort, wgPort }) {
+async function collect({ agentPort, wgPort }) {
   const osr   = osRelease();
   const wgVer = tryRun("wg --version | awk '{print $2}'");
   const fwd4  = tryRun("sysctl -n net.ipv4.ip_forward 2>/dev/null") === "1";

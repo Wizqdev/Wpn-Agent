@@ -229,7 +229,7 @@ async function main() {
   let stopHealthMonitor = () => {};
 
   if (!skipWg) {
-    const report = preflight.collect({ agentPort: AGENT_PORT, wgPort: WG_PORT });
+    const report = await preflight.collect({ agentPort: AGENT_PORT, wgPort: WG_PORT });
     preflight.report(report);
     if (!report.ports.agentTcp.free) {
       log.warn(`tcp/${AGENT_PORT} is already bound — set WPN_AGENT_PORT to change it`);
