@@ -76,8 +76,8 @@ function speedLimited(ip) {
 // Banner
 // ---------------------------------------------------------------------------
 
-function banner(token, scheme) {
-  const ip     = preflight.publicIp() || "0.0.0.0";
+async function banner(token, scheme, cachedIp) {
+  const ip     = cachedIp || (await preflight.publicIp()) || "0.0.0.0";
   const pub    = wg.serverPubKey(identity.pubFile(DIR)) || "(none)";
   const live   = wg.liveInfo();
   const wgPort = live.listenPort || WG_PORT;
@@ -138,10 +138,11 @@ function routes() {
 
     "GET /info": async () => {
       const live = wg.liveInfo();
+      const ip   = (await preflight.publicIp()) || "0.0.0.0";
       return {
         version:   VERSION,
         publicKey: wg.serverPubKey(identity.pubFile(DIR)),
-        endpoint:  `${preflight.publicIp()}:${live.listenPort || WG_PORT}`,
+        endpoint:  `${ip}:${live.listenPort || WG_PORT}`,
         subnet:    live.subnet || "10.66.0.0/24",
         hostname:  os.hostname(),
         uptime:    os.uptime(),
@@ -227,9 +228,10 @@ async function main() {
   if (args.includes("--uninstall")) return service.uninstall();
 
   let stopHealthMonitor = () => {};
+  let report;
 
   if (!skipWg) {
-    const report = await preflight.collect({ agentPort: AGENT_PORT, wgPort: WG_PORT });
+    report = await preflight.collect({ agentPort: AGENT_PORT, wgPort: WG_PORT });
     preflight.report(report);
     if (!report.ports.agentTcp.free) {
       log.warn(`tcp/${AGENT_PORT} is already bound — set WPN_AGENT_PORT to change it`);
@@ -248,7 +250,7 @@ async function main() {
 
   const token = identity.token(DIR);
 
-  if (args.includes("--print"))   return banner(token, tls ? "https" : "http");
+  if (args.includes("--print"))   return await banner(token, tls ? "https" : "http", report?.ipv4);
   if (args.includes("--install")) return service.install(AGENT_PORT);
 
   echo.start();
@@ -258,7 +260,7 @@ async function main() {
   else if (STEALTH.error)  log.warn(`stealth unavailable: ${STEALTH.error}`);
 
   const srv = server.serve({ port: AGENT_PORT, token, tls, routes: routes(), health });
-  banner(token, srv.scheme);
+  await banner(token, srv.scheme, report?.ipv4);
   log.ok(`control API listening on :${AGENT_PORT} (${srv.scheme})`);
 
   // Graceful shutdown
