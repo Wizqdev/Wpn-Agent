@@ -17,7 +17,7 @@
 
 "use strict";
 
-const { tryRun, log } = require("./util");
+const { tryRunBin, log } = require("./util");
 const firewall = require("./firewall");
 
 // ---------------------------------------------------------------------------
@@ -64,7 +64,7 @@ let _busy = false;
  * @returns {Promise<boolean>}
  */
 async function isWgUp() {
-  return (await tryRun("wg show interfaces") || "")
+  return (await tryRunBin("wg", ["show", "interfaces"]) || "")
     .split(/\s+/)
     .includes(WG_IFACE);
 }
@@ -118,7 +118,7 @@ function start({ wgConf, wanIf }) {
       }
 
       log.warn(`${WG_IFACE} is DOWN — self-heal attempt ${_state.healAttempts}/${MAX_HEAL_ATTEMPTS}`);
-      await tryRun(`wg-quick up ${wgConf}`);
+      await tryRunBin("wg-quick", ["up", wgConf]);
 
       if (await isWgUp()) {
         _state.up        = true;
@@ -150,4 +150,4 @@ function start({ wgConf, wanIf }) {
  */
 const status = () => ({ ..._state });
 
-module.exports = { start, status, isWgUp };
+module.exports = { start, status };

@@ -13,7 +13,7 @@
 const os = require("os");
 const fs = require("fs");
 const https = require("https");
-const { tryRun } = require("./util");
+const { tryRun, tryRunBin } = require("./util");
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -181,20 +181,20 @@ const portFree = async (port, proto) => {
  */
 async function collect({ agentPort, wgPort }) {
   const osr   = osRelease();
-  const wgVer = await tryRun("wg --version | awk '{print $2}'");
-  const fwd4  = (await tryRun("sysctl -n net.ipv4.ip_forward 2>/dev/null")) === "1";
-  const fwd6  = (await tryRun("sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null")) === "1";
+  const wgVer = ((await tryRunBin("wg", ["--version"])) || "").split(/\s+/)[1] || null;
+  const fwd4  = (await tryRunBin("sysctl", ["-n", "net.ipv4.ip_forward"])) === "1";
+  const fwd6  = (await tryRunBin("sysctl", ["-n", "net.ipv6.conf.all.forwarding"])) === "1";
 
   const [ipv4, wanIf, pkgMgr, systemd, ufw, agentFree, wgFree, ifaces] =
     await Promise.all([
       publicIp(),
       tryRun("ip route show default | awk '/default/ {print $5; exit}'"),
       detectPkgMgr(),
-      tryRun("systemctl --version"),
+      tryRunBin("systemctl", ["--version"]),
       tryRun("command -v ufw"),
       portFree(agentPort, "tcp"),
       portFree(wgPort, "udp"),
-      tryRun("wg show interfaces"),
+      tryRunBin("wg", ["show", "interfaces"]),
     ]);
 
   return {

@@ -19,7 +19,7 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
-const { run } = require("./util");
+const { runBin } = require("./util");
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -61,10 +61,10 @@ async function ensure(dir) {
   const keyPath  = path.join(dir, KEY_FILE);
   if (!fs.existsSync(certPath) || !fs.existsSync(keyPath)) {
     try {
-      await run(
-        `openssl req -x509 -newkey rsa:2048 -nodes -days 3650 ` +
-          `-keyout ${keyPath} -out ${certPath} -subj "/CN=wpn-agent" 2>/dev/null`
-      );
+      await runBin("openssl", [
+        "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650",
+        "-keyout", keyPath, "-out", certPath, "-subj", "/CN=wpn-agent",
+      ]);
       fs.chmodSync(keyPath, 0o600);
     } catch {
       return { tls: false };
@@ -125,4 +125,4 @@ function fingerprint(dir) {
  */
 const pubFile = (dir) => path.join(dir, PUB_FILE);
 
-module.exports = { ensure, token, cert, key, fingerprint, pubFile, PUB_FILE };
+module.exports = { ensure, token, cert, key, fingerprint, pubFile };
