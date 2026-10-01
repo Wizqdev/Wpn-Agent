@@ -1,11 +1,15 @@
 /**
- * @fileoverview Shared utilities — shell execution helpers and structured logger.
+ * @fileoverview Shared utilities — async shell execution helpers and
+ * structured logger.
  *
- * Two execution primitives are provided:
+ * Two execution primitives are provided (both async — they never block the
+ * event loop, so in-flight API requests and health checks stay responsive
+ * while system commands run):
  *  - {@link run}    — shell string via `/bin/sh -c` (for compound commands with
  *                     pipes and redirects)
- *  - {@link runBin} — `execFileSync` with an arg array; no shell involved,
- *                     completely immune to injection; preferred for all wg/ip/systemctl calls
+ *  - {@link runBin} — `execFile` with an arg array; no shell involved,
+ *                     completely immune to injection; preferred for all
+ *                     wg/ip/systemctl calls
  *
  * The logger supports two output modes:
  *  - **Plain** (default): human-readable `[✓] message` lines to stdout/stderr
@@ -15,7 +19,11 @@
 
 "use strict";
 
-const { execSync, execFileSync } = require("child_process");
+const { exec, execFile } = require("child_process");
+const { promisify } = require("util");
+
+const execAsync     = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 // ---------------------------------------------------------------------------
 // Shell helpers
@@ -27,18 +35,18 @@ const { execSync, execFileSync } = require("child_process");
  * process substitution).  For simple binary invocations prefer {@link runBin}.
  *
  * @param {string} cmd - Shell command string.
- * @param {import("child_process").ExecSyncOptions} [opts]
- * @returns {string} Trimmed stdout.
- * @throws {Error} If the command exits non-zero.
+ * @param {import("child_process").ExecOptions} [opts]
+ * @returns {Promise<string>} Trimmed stdout.
+ * @throws {Error} If the command exits non-zero.  `err.stderr` is attached.
  */
-const run = (cmd, opts = {}) =>
-  execSync(cmd, {
-    stdio: ["ignore", "pipe", "pipe"],
+async function run(cmd, opts = {}) {
+  const { stdout } = await execAsync(cmd, {
     timeout: 120_000,
+    maxBuffer: 16 * 1_024 * 1_024,
     ...opts,
-  })
-    .toString()
-    .trim();
+  });
+  return stdout.toString().trim();
+}
 
 /**
  * Run a binary with an explicit argument array (no shell, no injection risk).
@@ -46,48 +54,36 @@ const run = (cmd, opts = {}) =>
  *
  * @param {string}   bin  - Binary name or absolute path.
  * @param {string[]} args - Argument array.
- * @param {import("child_process").ExecFileSyncOptions} [opts]
- * @returns {string} Trimmed stdout.
- * @throws {Error} If the command exits non-zero.
+ * @param {import("child_process").ExecFileOptions} [opts]
+ * @returns {Promise<string>} Trimmed stdout.
+ * @throws {Error} If the command exits non-zero.  `err.stderr` is attached.
  */
-const runBin = (bin, args, opts = {}) =>
-  execFileSync(bin, args, {
-    stdio: ["ignore", "pipe", "pipe"],
+async function runBin(bin, args, opts = {}) {
+  const { stdout } = await execFileAsync(bin, args, {
     timeout: 120_000,
+    maxBuffer: 16 * 1_024 * 1_024,
     ...opts,
-  })
-    .toString()
-    .trim();
+  });
+  return stdout.toString().trim();
+}
 
 /**
- * Like {@link run} but returns `null` instead of throwing on any error.
+ * Like {@link run} but resolves to `null` instead of throwing on any error.
  * Use for probing optional system features.
  *
  * @param {string} cmd
- * @returns {string|null}
+ * @returns {Promise<string|null>}
  */
-const tryRun = (cmd) => {
-  try {
-    return run(cmd);
-  } catch {
-    return null;
-  }
-};
+const tryRun = (cmd) => run(cmd).catch(() => null);
 
 /**
- * Like {@link runBin} but returns `null` instead of throwing.
+ * Like {@link runBin} but resolves to `null` instead of throwing.
  *
  * @param {string}   bin
  * @param {string[]} args
- * @returns {string|null}
+ * @returns {Promise<string|null>}
  */
-const tryRunBin = (bin, args) => {
-  try {
-    return runBin(bin, args);
-  } catch {
-    return null;
-  }
-};
+const tryRunBin = (bin, args) => runBin(bin, args).catch(() => null);
 
 // ---------------------------------------------------------------------------
 // Environment

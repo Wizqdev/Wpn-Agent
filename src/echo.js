@@ -83,10 +83,23 @@ function start() {
 }
 
 /**
+ * Close the echo socket (graceful shutdown).  Safe to call when not started.
+ *
+ * @returns {void}
+ */
+function stop() {
+  if (!sock) return;
+  try {
+    sock.close();
+  } catch {}
+  sock = null;
+}
+
+/**
  * Return the configured echo port regardless of whether the socket is bound.
  *
  * @returns {number}
  */
 const port = () => PORT;
 
-module.exports = { start, port };
+module.exports = { start, stop, port };

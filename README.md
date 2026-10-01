@@ -48,9 +48,13 @@ sudo node bin/wpn-agent
    Agent key:      <random token>
    Server pubkey:  <wireguard public key>
    WG endpoint:    <vps-ip>:51820/udp
+   TLS sha256:     <cert fingerprint — pin this in the API>
 ════════════════════════════════════════════════════════════
  Add it:  Wpn Admin → Servers → label + URL + key.
 ```
+
+(When running under systemd the key line is redacted — `wpn-agent --print`
+reveals it interactively.)
 
 Paste the **URL + key** in **Wpn Admin → Servers** — the node links instantly.
 
@@ -67,7 +71,7 @@ Paste the **URL + key** in **Wpn Admin → Servers** — the node links instantl
 | `node bin/wpn-agent` | Preflight → bootstrap WireGuard → serve control API |
 | `node bin/wpn-agent --print` | Re-print Agent URL + key |
 | `node bin/wpn-agent --install` | Deploy to `/opt/wpn-agent` + register systemd service |
-| `node bin/wpn-agent --uninstall` | Remove the service (identity kept in `/etc/wpn-agent`) |
+| `node bin/wpn-agent --uninstall` | Remove the service **and** tear down the data plane (wg0, NAT, sysctl, stealth). Identity + WG server key kept in `/etc/wpn-agent` + `/etc/wireguard` |
 | `node bin/wpn-agent --skip-wg` | API only — skip WireGuard (dev smoke testing) |
 
 ---
@@ -101,8 +105,9 @@ All routes except `GET /health` require `Authorization: Bearer <agent-key>`.
 | `GET /stats` | ✓ | Peer counts, rx/tx bytes, system load |
 | `GET /peers` | ✓ | List all peers (pubkey, endpoint, traffic, handshake) |
 | `GET /peers/usage` | ✓ | Per-peer rx/tx/handshake for usage accounting |
-| `POST /peers` | ✓ | `{ publicKey, address }` — add a peer |
-| `DELETE /peers/:key` | ✓ | Remove a peer by public key |
+| `POST /peers` | ✓ | `{ publicKey, address }` — add a peer (address must be inside the node subnet, not the server IP, not already claimed) |
+| `DELETE /peers` | ✓ | `{ publicKey }` — remove a peer (body form; simplest) |
+| `DELETE /peers/:key` | ✓ | Remove a peer by public key — **URL-encode the key** (`encodeURIComponent`); base64 keys may contain `/` and `=` |
 | `GET /capabilities` | ✓ | Feature flags (stealth, echo port, wg version) |
 | `POST /update` | ✓ | `git pull --ff-only` + systemd restart |
 | `GET /speedtest` | — | Bandwidth probe (public, rate-limited to 4 req/min/IP, max 8 MiB) |
@@ -122,6 +127,13 @@ survive reboots.
 | `WPN_ECHO_PORT` | `44665` | UDP echo reflector port |
 | `WPN_STEALTH` | *(auto)* | Set to `0` to disable the stealth relay entirely |
 | `WPN_STEALTH_PORT` | *(auto)* | Override stealth port (default: 443, fallback 8443) |
+| `WPN_WG_IFACE` | `wg0` | WireGuard interface name |
+| `WPN_SUBNET_V4` | `10.66.0.1/24` | Tunnel IPv4 subnet (server address/prefix) |
+| `WPN_SUBNET_V6` | `fd00:66::1/64` | Tunnel IPv6 subnet |
+| `WPN_LOG_JSON` | `0` | Set to `1` for newline-delimited JSON logs |
+
+On systemd installs, put overrides in `/etc/wpn-agent/agent.env`
+(`EnvironmentFile=` is wired into the unit), then `systemctl restart wpn-agent`.
 
 ---
 
@@ -129,17 +141,31 @@ survive reboots.
 
 - **Bearer token** — 192-bit random secret stored at `/etc/wpn-agent/token`
   (mode 0600).  Treat it like a password; rotate by deleting the file and
-  restarting the agent.
-- **TLS** — self-signed RSA-2048, 10-year cert.  The Wpn API skips cert
-  verification but the bearer token authenticates every request using a
-  constant-time comparison (`crypto.timingSafeEqual`).
+  restarting the agent.  The token is redacted from journal logs — reveal it
+  interactively with `wpn-agent --print`.
+- **TLS + pinning** — self-signed RSA-2048, 10-year cert.  Because it is
+  self-signed, the Wpn API should pin the certificate fingerprint
+  (`GET /info` → `tlsFingerprint`, also printed in the first-run banner)
+  instead of disabling verification — pinning is what stops a MITM from
+  terminating TLS and stealing the bearer token.  Requests authenticate via
+  `crypto.timingSafeEqual`.
+- **Peer validation** — `POST /peers` rejects malformed keys/addresses,
+  addresses outside the tunnel subnet, the server's own address, and IPs
+  already claimed by another peer (checked against both the live interface
+  and `wg0.conf`).
 - **Rate limiting** — 120 authenticated requests/minute per IP; `/speedtest`
-  is additionally capped at 4 requests/minute with an 8 MiB payload ceiling.
+  is additionally capped at 4 requests/minute with an 8 MiB payload ceiling;
+  the UDP echo reflector drops packets over 64 B and 200 pps per source so it
+  cannot be abused as an amplifier.
+- **MSS clamping** — PostUp applies TCPMSS `--clamp-mss-to-pmtu` on forwarded
+  TCP so clients behind PPPoE/low-MTU links don't hit TLS hangs.
 - **Root required** — the agent must run as root to manage `wg0`, iptables
   NAT rules, and `sysctl` forwarding.
 - **Stealth transport** — the pinned `wstunnel` binary is SHA-256 verified
   against both a hardcoded hash and the upstream `checksums.txt` before
   installation.
+- **Audit trail** — peer add/remove operations are logged with source IP and
+  (truncated) pubkey via the agent log.
 
 ---
 

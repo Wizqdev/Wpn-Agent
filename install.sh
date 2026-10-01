@@ -12,6 +12,7 @@
 #    curl -fsSL https://raw.githubusercontent.com/Wizqdev/Wpn-Agent/main/install.sh | sudo bash
 #
 #  The script is fully idempotent — safe to re-run for upgrades.
+#  All WPN_* env overrides are honoured (e.g. WPN_AGENT_PORT=5000 bash install.sh).
 # =============================================================================
 
 set -euo pipefail
@@ -32,12 +33,41 @@ log_warn() { echo -e "${C_YLW}[!]${C_RST} $*"; }
 log_err()  { echo -e "${C_RED}[✗]${C_RST} $*" >&2; }
 
 # ---------------------------------------------------------------------------
+# Port configuration — mirrors the agent's env vars so the firewall holes we
+# open match what the agent will actually bind.
+# ---------------------------------------------------------------------------
+AGENT_PORT="${WPN_AGENT_PORT:-44664}"
+WG_PORT="${WPN_WG_PORT:-51820}"
+ECHO_PORT="${WPN_ECHO_PORT:-44665}"
+STEALTH_PORT="${WPN_STEALTH_PORT:-443}"
+STEALTH_PORT2=8443   # agent fallback when 443 is taken
+
+# ---------------------------------------------------------------------------
 # Root check
 # ---------------------------------------------------------------------------
 if [[ $EUID -ne 0 ]]; then
   log_err "this script must be run as root (sudo bash install.sh)"
   exit 1
 fi
+
+# ---------------------------------------------------------------------------
+# Package install helper — covers every manager the agent itself supports.
+# ---------------------------------------------------------------------------
+pkg_install() {
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get install -y -qq "$@"
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y -q "$@"
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y -q "$@"
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -S --noconfirm --needed "$@"
+  elif command -v zypper >/dev/null 2>&1; then
+    zypper -n install "$@"
+  else
+    return 1
+  fi
+}
 
 # ---------------------------------------------------------------------------
 # Node.js — install if missing, upgrade via NodeSource if too old
@@ -55,13 +85,7 @@ install_node() {
     exit 1
   fi
 
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get install -y -qq nodejs
-  elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y -q nodejs
-  elif command -v yum >/dev/null 2>&1; then
-    yum install -y -q nodejs
-  else
+  if ! pkg_install nodejs; then
     log_err "no supported package manager — install Node.js ${NODE_MIN}+ manually"
     exit 1
   fi
@@ -91,10 +115,7 @@ else
   CLONE_DIR="$(mktemp -d)"
   log_info "piped install detected — cloning ${REPO_URL}…"
   if ! command -v git >/dev/null 2>&1; then
-    apt-get install -y -qq git 2>/dev/null \
-      || dnf install -y -q git 2>/dev/null \
-      || yum install -y -q git 2>/dev/null \
-      || { log_err "git not found — install it manually"; exit 1; }
+    pkg_install git || { log_err "git not found — install it manually"; exit 1; }
   fi
   git clone --depth 1 "$REPO_URL" "$CLONE_DIR"
   SRC="$CLONE_DIR"
@@ -106,8 +127,8 @@ fi
 DEST="/opt/wpn-agent"
 if [[ "$SRC" != "$DEST" ]]; then
   mkdir -p "$DEST"
-  cp -r "$SRC/src" "$SRC/bin" "$SRC/package.json" "$DEST/"
-  # Make the entrypoint executable.
+  # Copy the whole tree including .git so POST /update can fast-forward later.
+  cp -a "$SRC/." "$DEST/"
   chmod +x "$DEST/bin/wpn-agent"
   log_ok "agent deployed to ${DEST}"
 fi
@@ -116,13 +137,20 @@ fi
 # Firewall — open required ports in ufw (if available)
 # ---------------------------------------------------------------------------
 if command -v ufw >/dev/null 2>&1; then
-  ufw allow 44664/tcp >/dev/null || true   # control API
-  ufw allow 51820/udp >/dev/null || true   # WireGuard
-  ufw allow 443/tcp   >/dev/null || true   # stealth relay (wstunnel wss)
-  ufw allow 8443/tcp  >/dev/null || true   # stealth fallback
-  ufw allow 44665/udp >/dev/null || true   # UDP echo probe
-  log_ok "ufw rules added (44664/tcp, 51820/udp, 443/tcp, 8443/tcp, 44665/udp)"
+  ufw allow "${AGENT_PORT}/tcp"   >/dev/null || true   # control API
+  ufw allow "${WG_PORT}/udp"      >/dev/null || true   # WireGuard
+  ufw allow "${STEALTH_PORT}/tcp" >/dev/null || true   # stealth relay (wss)
+  ufw allow "${STEALTH_PORT2}/tcp">/dev/null || true   # stealth fallback
+  ufw allow "${ECHO_PORT}/udp"    >/dev/null || true   # UDP echo probe
+  log_ok "ufw rules added (${AGENT_PORT}/tcp, ${WG_PORT}/udp, ${STEALTH_PORT}/tcp, ${STEALTH_PORT2}/tcp, ${ECHO_PORT}/udp)"
 fi
+
+# ---------------------------------------------------------------------------
+# Create identity + show the operator their URL + key
+# ---------------------------------------------------------------------------
+# --print runs BEFORE --install so identity material exists before the service
+# starts — avoids a create-vs-create race between the CLI and the daemon.
+node "${DEST}/bin/wpn-agent" --print || true
 
 # ---------------------------------------------------------------------------
 # Install + start the systemd service
@@ -136,5 +164,5 @@ log_info "  Get URL + key:  node ${DEST}/bin/wpn-agent --print"
 log_info "  Follow logs:    journalctl -u wpn-agent -f"
 log_info "  Service status: systemctl status wpn-agent"
 log_info ""
-log_info "  Remember to open udp/51820 and tcp/44664 in your cloud"
+log_info "  Remember to open udp/${WG_PORT} and tcp/${AGENT_PORT} in your cloud"
 log_info "  provider's security group / firewall policy."

@@ -84,8 +84,8 @@ async function install() {
   }
 
   const tmp = `/tmp/wstunnel-${WST_VERSION}.tar.gz`;
-  tryRun(`curl -fsSL -o ${tmp} ${BASE_URL}/${asset.file}`);
-  if (!fs.existsSync(tmp)) throw new Error("download failed");
+  const dl = await tryRun(`curl -fsSL -o ${tmp} ${BASE_URL}/${asset.file} || wget -qO ${tmp} ${BASE_URL}/${asset.file}`);
+  if (dl === null || !fs.existsSync(tmp)) throw new Error("download failed");
 
   const got = sha256(tmp);
   if (got !== asset.sha256) {
@@ -94,14 +94,14 @@ async function install() {
   }
 
   // Secondary verification against upstream checksums.txt.
-  const sums = tryRun(`curl -fsSL ${BASE_URL}/checksums.txt`);
+  const sums = await tryRun(`curl -fsSL ${BASE_URL}/checksums.txt || wget -qO- ${BASE_URL}/checksums.txt`);
   if (sums && !sums.includes(`${asset.sha256}  ${asset.file}`)) {
     fs.unlinkSync(tmp);
     throw new Error("release checksums.txt disagrees with pinned hash");
   }
 
   fs.mkdirSync(path.dirname(BIN), { recursive: true });
-  run(`tar -xzf ${tmp} -C ${path.dirname(BIN)} wstunnel`);
+  await run(`tar -xzf ${tmp} -C ${path.dirname(BIN)} wstunnel`);
   fs.chmodSync(BIN, 0o755);
   fs.unlinkSync(tmp);
 }
@@ -125,26 +125,38 @@ function stealthKey(dir) {
 }
 
 /**
- * Select the stealth port — 443 if a bind probe succeeds, 8443 as fallback.
- * `WPN_STEALTH_PORT` overrides both.
+ * Probe whether a TCP port can be bound.  `net.Server.listen()` reports
+ * EADDRINUSE asynchronously via the `'error'` event — a sync try/catch can
+ * never see it — so the bind is properly awaited.
  *
- * @returns {number}
+ * @param {number} port
+ * @returns {Promise<boolean>} `true` if the port was bindable.
  */
-function pickPort() {
+function canBind(port) {
+  return new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.once("error", () => resolve(false));
+    probe.once("listening", () => probe.close(() => resolve(true)));
+    probe.listen(port, "0.0.0.0");
+  });
+}
+
+/**
+ * Select the stealth port — try each candidate in order until a real bind
+ * succeeds.  `WPN_STEALTH_PORT` overrides both.
+ *
+ * @param {number[]} [candidates] - Defaults to [443, 8443].  Injectable for
+ *   tests (privileged ports need root).
+ * @returns {Promise<number>}
+ */
+async function pickPort(candidates = [443, 8443]) {
   if (process.env.WPN_STEALTH_PORT) {
     return parseInt(process.env.WPN_STEALTH_PORT, 10);
   }
-  for (const p of [443, 8443]) {
-    const probe = net.createServer();
-    try {
-      probe.listen(p, "0.0.0.0");
-      probe.close();
-      return p;
-    } catch {
-      // port in use — try next
-    }
+  for (const p of candidates) {
+    if (await canBind(p)) return p;
   }
-  return 8443;
+  return candidates[candidates.length - 1]; // last resort — wstunnel will log its own error
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +172,10 @@ function pickPort() {
  * Install and start the `wstunnel` stealth relay.  Never throws; failures
  * are returned as `{ enabled: false, error }`.
  *
+ * After enabling the unit on Linux, the service state is verified — a port
+ * conflict or binary failure would otherwise leave stealth advertised as
+ * enabled while the relay is dead.
+ *
  * @param {string} dir - Agent identity directory.
  * @param {{ wgPort: number }} opts
  * @returns {Promise<StealthState>}
@@ -173,7 +189,7 @@ async function ensure(dir, { wgPort }) {
     }
 
     const key  = stealthKey(dir);
-    const port = pickPort();
+    const port = await pickPort();
 
     if (process.platform === "linux") {
       const execArgs =
@@ -185,20 +201,34 @@ async function ensure(dir, { wgPort }) {
         [
           "[Unit]",
           "Description=Wpn stealth transport (wstunnel)",
-          "After=network.target wpn-agent.service",
+          "After=network-online.target wpn-agent.service",
+          "Wants=network-online.target",
           "",
           "[Service]",
           `ExecStart=${BIN} ${execArgs}`,
           "Restart=always",
           "RestartSec=3",
+          "ProtectHome=true",
+          "PrivateTmp=true",
           "",
           "[Install]",
           "WantedBy=multi-user.target",
           "",
         ].join("\n")
       );
-      tryRun("systemctl daemon-reload");
-      tryRun("systemctl enable --now wpn-stealth");
+      await tryRun("systemctl daemon-reload");
+      await tryRun("systemctl enable --now wpn-stealth");
+
+      // Verify the relay actually started — bind failure/crash shouldn't be
+      // advertised as "enabled" to the control plane.
+      await new Promise((r) => setTimeout(r, 800)); // let it bind/crash
+      const active = await tryRun("systemctl is-active wpn-stealth");
+      if (active !== "active") {
+        return {
+          enabled: false,
+          error: `wpn-stealth unit is ${active || "unknown"} (check journalctl -u wpn-stealth)`,
+        };
+      }
     }
 
     // On non-Linux (macOS dev smoke): no systemd — just report configured.
@@ -208,4 +238,4 @@ async function ensure(dir, { wgPort }) {
   }
 }
 
-module.exports = { ensure, BIN, WST_VERSION };
+module.exports = { ensure, pickPort, canBind, BIN, WST_VERSION };

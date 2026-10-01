@@ -3,9 +3,9 @@
  * print a human-readable summary.  The operator can read this output and
  * sanity-check the box before changes are applied.
  *
- * `publicIp()` is memoised: the first caller (collect) pays the cost of two
- * potential HTTP round-trips; all subsequent callers get the cached value
- * instantly.
+ * `publicIp()` is memoised with a TTL: callers share one resolution, but the
+ * value refreshes periodically so a failover/re-IP is eventually reflected in
+ * `/info` instead of being stale for the lifetime of the process.
  */
 
 "use strict";
@@ -38,49 +38,86 @@ const osRelease = () => {
 /**
  * Detect the first available package manager from a priority-ordered list.
  *
- * @returns {string|null}
+ * @returns {Promise<string|null>}
  */
-const detectPkgMgr = () => {
+const detectPkgMgr = async () => {
   for (const m of ["apt-get", "dnf", "yum", "pacman", "zypper"]) {
-    if (tryRun(`command -v ${m}`)) return m;
+    if (await tryRun(`command -v ${m}`)) return m;
   }
   return null;
 };
 
 // ---------------------------------------------------------------------------
-// Public IP — memoised so collect() and banner() share one HTTP round-trip.
+// Public IP — memoised with TTL so collect() and banner() share one lookup.
 // ---------------------------------------------------------------------------
 
-/** @type {Promise<string|null>|undefined} */
-let _publicIpPromise;
+/** How long a resolved public IP stays cached (ms). */
+const PUBLIC_IP_TTL_MS = 10 * 60_000;
+
+/** @type {{ t: number, p: Promise<string|null> }|undefined} */
+let _publicIpCache;
 
 /**
- * Check if an IPv4 address is in RFC1918 or RFC6598 private space.
+ * Check if an IPv4 address is in any non-globally-routable space:
+ * RFC1918, RFC6598 CGNAT, loopback, link-local, "this host", benchmark,
+ * multicast/reserved.  Anything listed here cannot be the node's real
+ * public endpoint.
  * @param {string} ip
  * @returns {boolean}
  */
 const isPrivateIp = (ip) => {
   const parts = ip.split(".").map(Number);
-  if (parts.length !== 4) return false;
-  if (parts[0] === 10) return true;
-  if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
-  if (parts[0] === 192 && parts[1] === 168) return true;
-  if (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) return true;
+  if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) {
+    return false;
+  }
+  const [a, b] = parts;
+  if (a === 0) return true;                            // 0.0.0.0/8   "this" network
+  if (a === 10) return true;                           // 10/8        RFC1918
+  if (a === 100 && b >= 64 && b <= 127) return true;   // 100.64/10   CGNAT
+  if (a === 127) return true;                          // 127/8       loopback
+  if (a === 169 && b === 254) return true;             // 169.254/16  link-local
+  if (a === 172 && b >= 16 && b <= 31) return true;    // 172.16/12   RFC1918
+  if (a === 192 && b === 0) return true;               // 192.0.0/24  IETF assignments
+  if (a === 192 && b === 168) return true;             // 192.168/16  RFC1918
+  if (a === 198 && (b === 18 || b === 19)) return true;// 198.18/15   benchmarking
+  if (a >= 224) return true;                           // 224/4 multicast + 240/4 reserved
   return false;
 };
 
 /**
- * Fetch public IP using native Node.js https.
+ * Bare-bones IPv4 shape+range check for the external-IP probe response.
+ * @param {string} ip
+ * @returns {boolean}
+ */
+const looksLikeIPv4 = (ip) =>
+  /^\d{1,3}(\.\d{1,3}){3}$/.test(ip) &&
+  ip.split(".").every((o) => parseInt(o, 10) <= 255);
+
+/**
+ * Fetch public IP using native Node.js https.  Hits the dedicated `/ip`
+ * endpoint (the bare root returns an HTML page for non-curl user agents) and
+ * strictly validates that the answer is actually a public IPv4 address —
+ * a captive portal or HTML response must never end up in the banner.
  * @returns {Promise<string|null>}
  */
 const fetchExternalIp = () =>
   new Promise((resolve) => {
-    const req = https.get("https://ifconfig.me", { timeout: 3000 }, (res) => {
-      if (res.statusCode !== 200) return resolve(null);
-      let data = "";
-      res.on("data", (chunk) => (data += chunk));
-      res.on("end", () => resolve(data.trim() || null));
-    });
+    const req = https.get(
+      "https://ifconfig.me/ip",
+      { timeout: 3000, headers: { accept: "text/plain" } },
+      (res) => {
+        if (res.statusCode !== 200) return resolve(null);
+        let data = "";
+        res.on("data", (chunk) => {
+          data += chunk;
+          if (data.length > 64) req.destroy(); // an IP is ≤15 chars — bail on junk
+        });
+        res.on("end", () => {
+          const ip = data.trim();
+          resolve(looksLikeIPv4(ip) && !isPrivateIp(ip) ? ip : null);
+        });
+      }
+    );
     req.on("error", () => resolve(null));
     req.on("timeout", () => {
       req.destroy();
@@ -92,24 +129,30 @@ const fetchExternalIp = () =>
  * Determine the host's public IPv4 address.
  * 1. Inspects the active default route interface. If its IP is public, use it.
  * 2. If it's a private IP (NATed, like EC2/GCP), queries via HTTPS natively.
- * Memoised for the lifetime of the process.
+ * Memoised with a {@link PUBLIC_IP_TTL_MS} TTL.
  *
  * @returns {Promise<string|null>}
  */
 const publicIp = async () => {
-  if (_publicIpPromise !== undefined) return _publicIpPromise;
+  const now = Date.now();
+  if (_publicIpCache && now - _publicIpCache.t < PUBLIC_IP_TTL_MS) {
+    return _publicIpCache.p;
+  }
 
-  _publicIpPromise = (async () => {
-    const localIp = tryRun("ip -4 route get 8.8.8.8 | grep -oP 'src \\K\\S+'");
-    if (localIp && !isPrivateIp(localIp)) return localIp;
-    
-    const extIp = await fetchExternalIp();
-    if (extIp) return extIp;
+  _publicIpCache = {
+    t: now,
+    p: (async () => {
+      const localIp = await tryRun("ip -4 route get 8.8.8.8 | grep -oP 'src \\K\\S+'");
+      if (localIp && looksLikeIPv4(localIp) && !isPrivateIp(localIp)) return localIp;
 
-    return localIp || null; // fallback to whatever local IP we found
-  })();
+      const extIp = await fetchExternalIp();
+      if (extIp) return extIp;
 
-  return _publicIpPromise;
+      return looksLikeIPv4(localIp || "") ? localIp : null; // last resort: any valid local addr
+    })(),
+  };
+
+  return _publicIpCache.p;
 };
 
 /**
@@ -117,11 +160,11 @@ const publicIp = async () => {
  *
  * @param {number} port
  * @param {"tcp"|"udp"} proto
- * @returns {boolean} `true` if the port is free (or `ss` is not available).
+ * @returns {Promise<boolean>} `true` if the port is free (or `ss` is unavailable).
  */
-const portFree = (port, proto) => {
+const portFree = async (port, proto) => {
   const flag = proto === "udp" ? "-lun" : "-ltn";
-  const out = tryRun(`ss ${flag} 2>/dev/null | grep -c ':${port} '`);
+  const out = await tryRun(`ss ${flag} 2>/dev/null | grep -c ':${port} '`);
   return out === "0" || out === null; // null → ss missing; assume free
 };
 
@@ -134,13 +177,25 @@ const portFree = (port, proto) => {
  * preflight report.
  *
  * @param {{ agentPort: number, wgPort: number }} opts
- * @returns {object} Machine report object.
+ * @returns {Promise<object>} Machine report object.
  */
 async function collect({ agentPort, wgPort }) {
   const osr   = osRelease();
-  const wgVer = tryRun("wg --version | awk '{print $2}'");
-  const fwd4  = tryRun("sysctl -n net.ipv4.ip_forward 2>/dev/null") === "1";
-  const fwd6  = tryRun("sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null") === "1";
+  const wgVer = await tryRun("wg --version | awk '{print $2}'");
+  const fwd4  = (await tryRun("sysctl -n net.ipv4.ip_forward 2>/dev/null")) === "1";
+  const fwd6  = (await tryRun("sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null")) === "1";
+
+  const [ipv4, wanIf, pkgMgr, systemd, ufw, agentFree, wgFree, ifaces] =
+    await Promise.all([
+      publicIp(),
+      tryRun("ip route show default | awk '/default/ {print $5; exit}'"),
+      detectPkgMgr(),
+      tryRun("systemctl --version"),
+      tryRun("command -v ufw"),
+      portFree(agentPort, "tcp"),
+      portFree(wgPort, "udp"),
+      tryRun("wg show interfaces"),
+    ]);
 
   return {
     os:       osr,
@@ -148,20 +203,20 @@ async function collect({ agentPort, wgPort }) {
     arch:     os.arch(),
     hostname: os.hostname(),
     node:     process.version,
-    ipv4:     await publicIp(),
-    wanIf:
-      tryRun("ip route show default | awk '/default/ {print $5; exit}'") ||
-      "eth0",
-    pkgMgr:  detectPkgMgr(),
-    systemd: !!tryRun("systemctl --version"),
-    ufw:     !!tryRun("command -v ufw"),
+    ipv4,
+    wanIf:    wanIf || "eth0",
+    pkgMgr,
+    systemd: !!systemd,
+    ufw:     !!ufw,
     wg:      { installed: !!wgVer, version: wgVer },
     forwarding: { ipv4: fwd4, ipv6: fwd6 },
     ports: {
-      agentTcp: { port: agentPort, free: portFree(agentPort, "tcp") },
-      wgUdp:    { port: wgPort,    free: portFree(wgPort,    "udp") },
+      agentTcp: { port: agentPort, free: agentFree },
+      wgUdp:    { port: wgPort,    free: wgFree },
     },
-    wgUp: (tryRun("wg show interfaces") || "").split(/\s+/).includes(process.env.WPN_WG_IFACE || "wg0"),
+    wgUp: (ifaces || "")
+      .split(/\s+/)
+      .includes(process.env.WPN_WG_IFACE || "wg0"),
   };
 }
 
@@ -181,7 +236,7 @@ const row = (k, v) =>
 /**
  * Print the preflight report to stdout.
  *
- * @param {ReturnType<typeof collect>} r
+ * @param {Awaited<ReturnType<typeof collect>>} r
  */
 function report(r) {
   process.stdout.write("\n──────────────── machine ────────────────\n");
@@ -205,4 +260,4 @@ function report(r) {
   process.stdout.write("─────────────────────────────────────────\n\n");
 }
 
-module.exports = { collect, report, publicIp };
+module.exports = { collect, report, publicIp, isPrivateIp };

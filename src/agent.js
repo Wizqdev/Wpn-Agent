@@ -3,6 +3,12 @@
  *
  * Handles graceful shutdown on SIGTERM/SIGINT, global error boundaries,
  * and ties together preflight, WireGuard bootstrap, and the API server.
+ *
+ * Command paths:
+ *  - `--print` / `--install` / `--uninstall` are operational commands and exit
+ *    BEFORE the WireGuard bootstrap — printing the agent key must not mutate
+ *    the host (install packages, rewrite sysctl, bring up interfaces).
+ *  - bare run / `--skip-wg` → preflight → bootstrap → serve the control API.
  */
 
 "use strict";
@@ -11,8 +17,7 @@ const crypto         = require("crypto");
 const fs             = require("fs");
 const os             = require("os");
 const path           = require("path");
-const { execFileSync } = require("child_process");
-const { isRoot, log } = require("./util");
+const { isRoot, log, runBin } = require("./util");
 const preflight      = require("./preflight");
 const wg             = require("./wireguard");
 const identity       = require("./identity");
@@ -31,6 +36,9 @@ const VERSION = require("../package.json").version;
 const AGENT_PORT = parseInt(process.env.WPN_AGENT_PORT || "44664", 10);
 const WG_PORT    = parseInt(process.env.WPN_WG_PORT    || "51820", 10);
 const DIR        = process.env.WPN_AGENT_DIR || "/etc/wpn-agent";
+
+/** Directory the agent code actually runs from — used by `POST /update`. */
+const APP_DIR = path.resolve(__dirname, "..");
 
 let STEALTH = { enabled: false };
 
@@ -55,6 +63,7 @@ process.on("unhandledRejection", (reason) => {
 const SPEED_LIMIT = 4;
 const SPEED_DEF   = 2 * 1_024 * 1_024;
 const SPEED_MAX   = 8 * 1_024 * 1_024;
+const SPEED_CHUNK = 65_536;
 
 const speedHits = new Map();
 
@@ -72,24 +81,50 @@ function speedLimited(ip) {
   return false;
 }
 
+/**
+ * Payload source for /speedtest.  Filled once with random bytes and reused —
+ * CSPRNG per chunk would burn CPU for zero benefit; the bytes just need to be
+ * non-zero and non-constant so compression can't cheat the measurement.
+ */
+let _speedPayload = null;
+const speedPayload = () => (_speedPayload ||= crypto.randomBytes(SPEED_CHUNK));
+
 // ---------------------------------------------------------------------------
 // Banner
 // ---------------------------------------------------------------------------
 
-async function banner(token, scheme, cachedIp) {
-  const ip     = cachedIp || (await preflight.publicIp()) || "0.0.0.0";
-  const pub    = wg.serverPubKey(identity.pubFile(DIR)) || "(none)";
-  const live   = wg.liveInfo();
-  const wgPort = live.listenPort || WG_PORT;
+/**
+ * Print the operator banner.  The bearer token is only revealed on an
+ * interactive TTY (`--print`, manual run); under systemd/journald it is
+ * redacted so the API secret is not persisted in `journalctl` for anyone
+ * with journal read access.
+ *
+ * @param {string}      token
+ * @param {string}      scheme    - "https" | "http"
+ * @param {string|null} cachedIp
+ * @param {{ forceReveal?: boolean }} [opts]
+ */
+async function banner(token, scheme, cachedIp, opts = {}) {
+  const ip        = cachedIp || (await preflight.publicIp()) || "0.0.0.0";
+  const pub       = (await wg.serverPubKey(identity.pubFile(DIR))) || "(none)";
+  const live      = await wg.liveInfo();
+  const wgPort    = live.listenPort || WG_PORT;
+  const fp        = identity.fingerprint(DIR);
+  const reveal    = opts.forceReveal ?? process.stdout.isTTY === true;
+  const shownKey  = reveal
+    ? token
+    : "(hidden in logs — run `wpn-agent --print` as root to reveal)";
+
   process.stdout.write(
     [
       "",
       "════════════════════════════════════════════════════════════",
       " Wpn node agent is live",
       `   Agent URL:      ${scheme}://${ip}:${AGENT_PORT}`,
-      `   Agent key:      ${token}`,
+      `   Agent key:      ${shownKey}`,
       `   Server pubkey:  ${pub}`,
       `   WG endpoint:    ${ip}:${wgPort}/udp`,
+      ...(fp ? [`   TLS sha256:     ${fp}  (pin this in the API)`] : []),
       "════════════════════════════════════════════════════════════",
       " Add it:  Wpn Admin → Servers → label + URL + key.",
       " Note:    open udp/" + wgPort + " and tcp/" + AGENT_PORT + " in your cloud firewall.",
@@ -123,10 +158,11 @@ function routes() {
         "content-length": n,
         "cache-control":  "no-store",
       });
+      const payload = speedPayload();
       let sent = 0;
       while (sent < n) {
         if (res.destroyed || req.destroyed) return undefined;
-        const chunk = crypto.randomBytes(Math.min(65_536, n - sent));
+        const chunk = n - sent >= SPEED_CHUNK ? payload : payload.subarray(0, n - sent);
         sent += chunk.length;
         if (!res.write(chunk)) {
           await new Promise((r) => res.once("drain", r));
@@ -137,15 +173,16 @@ function routes() {
     },
 
     "GET /info": async () => {
-      const live = wg.liveInfo();
+      const live = await wg.liveInfo();
       const ip   = (await preflight.publicIp()) || "0.0.0.0";
       return {
         version:   VERSION,
-        publicKey: wg.serverPubKey(identity.pubFile(DIR)),
+        publicKey: await wg.serverPubKey(identity.pubFile(DIR)),
         endpoint:  `${ip}:${live.listenPort || WG_PORT}`,
         subnet:    live.subnet || "10.66.0.0/24",
         hostname:  os.hostname(),
         uptime:    os.uptime(),
+        tlsFingerprint: identity.fingerprint(DIR),
         stealth:   STEALTH.enabled
           ? { enabled: true, port: STEALTH.port, key: STEALTH.key }
           : { enabled: false },
@@ -153,30 +190,47 @@ function routes() {
     },
 
     "GET /stats": async () => ({
-      ...wg.stats(),
+      ...(await wg.stats()),
       version:  VERSION,
       hostname: os.hostname(),
       uptime:   os.uptime(),
       cpuCount: os.cpus().length,
       memTotal: os.totalmem(),
       memFree:  os.freemem(),
-      wgVersion: wg.version(),
+      wgVersion: await wg.version(),
       iface:    wg.WG_IFACE,
     }),
 
-    "GET /peers": async () => wg.dump().peers,
+    "GET /peers": async () => (await wg.dump()).peers,
 
     "GET /peers/usage": async () =>
-      wg.dump().peers.map((p) => ({
+      (await wg.dump()).peers.map((p) => ({
         publicKey:       p.publicKey,
         rx:              p.rx,
         tx:              p.tx,
         latestHandshake: p.latestHandshake,
       })),
 
-    "POST /peers": async (body) => wg.addPeer(body.publicKey, body.address),
+    "POST /peers": async (body, _p, { ip }) => {
+      const result = await wg.addPeer(body.publicKey, body.address);
+      log.info(`peer added by ${ip}`, {
+        pubkey: String(body.publicKey).slice(0, 8),
+        address: body.address,
+      });
+      return result;
+    },
 
-    "DELETE /peers/:key": async (_b, p) => wg.removePeer(p.key),
+    "DELETE /peers": async (body, _p, { ip }) => {
+      const result = await wg.removePeer(body.publicKey);
+      log.info(`peer removed by ${ip}`, { pubkey: String(body.publicKey).slice(0, 8) });
+      return result;
+    },
+
+    "DELETE /peers/:key": async (_b, p, { ip }) => {
+      const result = await wg.removePeer(p.key);
+      log.info(`peer removed by ${ip}`, { pubkey: String(p.key).slice(0, 8) });
+      return result;
+    },
 
     "GET /capabilities": async () => ({
       stealth:      STEALTH.enabled,
@@ -186,27 +240,30 @@ function routes() {
       echoPort:     echo.port(),
       streaming:    false,
       version:      VERSION,
-      wgVersion:    wg.version(),
+      wgVersion:    await wg.version(),
     }),
 
     "POST /update": async () => {
-      if (!fs.existsSync(path.join(DIR, ".git"))) {
-        throw err(409, "agent directory is not a git checkout — update manually");
+      // The code lives in APP_DIR (e.g. /opt/wpn-agent); DIR only holds
+      // identity material.  install.sh deploys `.git` along with the code so
+      // fast-forward pulls work here.
+      if (!fs.existsSync(path.join(APP_DIR, ".git"))) {
+        throw err(409, "agent is not a git checkout — update manually");
       }
       let output = "";
       try {
-        output = execFileSync("git", ["-C", DIR, "pull", "--ff-only"], {
-          timeout:  60_000,
-          encoding: "utf8",
-        }).trim();
+        output = await runBin("git", ["-C", APP_DIR, "pull", "--ff-only"], {
+          timeout: 60_000,
+        });
       } catch (e) {
-        throw err(502, `git pull failed: ${e.message.slice(0, 300)}`);
+        throw err(502, `git pull failed: ${String(e.message).slice(0, 300)}`);
       }
       if (process.platform === "linux") {
         setTimeout(() => {
-          execFileSync("systemctl", ["restart", "wpn-agent"]);
+          runBin("systemctl", ["restart", "wpn-agent"]).catch(() => {});
         }, 1_000).unref();
       }
+      log.info("agent updated via /update", { from: VERSION });
       return { ok: true, from: VERSION, output };
     },
   };
@@ -225,8 +282,26 @@ async function main() {
     process.exit(1);
   }
 
+  // ── Operational commands (no bootstrap, no host mutation) ────────────────
   if (args.includes("--uninstall")) return service.uninstall();
 
+  const { tls } = await identity.ensure(DIR);
+
+  // Cache the server pubkey for --print/--install consumers.  Works before
+  // wireguard-tools is installed — falls back to pure-JS X25519.
+  try {
+    const { pub } = await wg.ensureServerKey();
+    if (pub) fs.writeFileSync(identity.pubFile(DIR), pub + "\n", { mode: 0o644 });
+  } catch {}
+
+  const token = identity.token(DIR);
+
+  if (args.includes("--print")) {
+    return banner(token, tls ? "https" : "http", null, { forceReveal: true });
+  }
+  if (args.includes("--install")) return service.install(AGENT_PORT);
+
+  // ── Bootstrap ─────────────────────────────────────────────────────────────
   let stopHealthMonitor = () => {};
   let report;
 
@@ -236,22 +311,11 @@ async function main() {
     if (!report.ports.agentTcp.free) {
       log.warn(`tcp/${AGENT_PORT} is already bound — set WPN_AGENT_PORT to change it`);
     }
-    await wg.ensure(report, { wgPort: WG_PORT, agentPort: AGENT_PORT });
-    stopHealthMonitor = health.start(wg.WG_CONF);
+    await wg.ensure(report, { wgPort: WG_PORT, agentPort: AGENT_PORT, echoPort: echo.port() });
+    stopHealthMonitor = health.start({ wgConf: wg.WG_CONF, wanIf: report.wanIf });
   }
 
-  const { tls } = identity.ensure(DIR);
   if (!tls) log.warn("openssl unavailable — agent will serve plain HTTP");
-
-  try {
-    const pub = wg.serverPubKey(identity.pubFile(DIR));
-    if (pub) fs.writeFileSync(identity.pubFile(DIR), pub + "\n", { mode: 0o644 });
-  } catch {}
-
-  const token = identity.token(DIR);
-
-  if (args.includes("--print"))   return await banner(token, tls ? "https" : "http", report?.ipv4);
-  if (args.includes("--install")) return service.install(AGENT_PORT);
 
   echo.start();
 
@@ -267,6 +331,7 @@ async function main() {
   const shutdown = async (signal) => {
     log.info(`received ${signal} — draining requests and shutting down...`);
     stopHealthMonitor();
+    echo.stop();
     await srv.shutdown();
     process.exit(0);
   };

@@ -16,6 +16,7 @@ const http   = require("http");
 const https  = require("https");
 const crypto = require("crypto");
 const identity = require("./identity");
+const { log } = require("./util");
 
 // ---------------------------------------------------------------------------
 // Rate limiting
@@ -55,9 +56,12 @@ function rateLimited(ip) {
  */
 const err = (status, message) => Object.assign(new Error(message), { status });
 
+/** Methods that may carry a JSON body. */
+const BODY_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
 /**
- * Buffer the full request body and parse as JSON.  Destroys the socket if
- * the body exceeds 64 KiB.
+ * Buffer the full request body and parse as JSON.  Rejects with a 413 when
+ * the body exceeds 64 KiB (socket is destroyed) and a 400 on bad JSON.
  *
  * @param {import("http").IncomingMessage} req
  * @returns {Promise<object>}
@@ -65,18 +69,28 @@ const err = (status, message) => Object.assign(new Error(message), { status });
 const readBody = (req) =>
   new Promise((resolve, reject) => {
     let data = "";
+    let done = false;
+    const fail = (e) => {
+      if (done) return;
+      done = true;
+      req.destroy();
+      reject(e);
+    };
     req.on("data", (c) => {
       data += c;
-      if (data.length > 64 * 1_024) req.destroy();
+      if (data.length > 64 * 1_024) fail(err(413, "body too large"));
     });
     req.on("end", () => {
+      if (done) return;
+      done = true;
       try {
         resolve(data ? JSON.parse(data) : {});
       } catch {
         reject(err(400, "bad JSON"));
       }
     });
-    req.on("error", reject);
+    req.on("error", () => fail(err(400, "request error")));
+    req.on("close", () => fail(err(400, "connection closed")));
   });
 
 /**
@@ -87,10 +101,11 @@ const readBody = (req) =>
  * @returns {boolean}
  */
 const authed = (req, token) => {
-  const given = Buffer.from(
-    (req.headers.authorization || "").replace(/^Bearer\s+/i, "")
-  );
-  const want = Buffer.from(token);
+  // Strict "Bearer <token>" — a bare token without the scheme is rejected.
+  const m = (req.headers.authorization || "").match(/^Bearer\s+(\S+)\s*$/i);
+  if (!m) return false;
+  const given = Buffer.from(m[1]);
+  const want  = Buffer.from(token);
   return given.length === want.length && crypto.timingSafeEqual(given, want);
 };
 
@@ -102,8 +117,10 @@ const authed = (req, token) => {
  * Match a parameterised route pattern against a URL path.
  *
  * @param {string} pattern - e.g. `"/peers/:key"`
- * @param {string} path    - Request URL path
- * @returns {object|null} Extracted params, or `null` on no match.
+ * @param {string} path    - Request URL path (still percent-encoded).
+ * @returns {object|null} Extracted params, or `null` on no match / malformed
+ *   percent-encoding.  Encoded slashes (`%2F`) decode into the param, which
+ *   is how base64 WireGuard keys containing `/` are transported.
  */
 function match(pattern, path) {
   const pp = pattern.split("/");
@@ -111,8 +128,13 @@ function match(pattern, path) {
   if (pp.length !== ap.length) return null;
   const params = {};
   for (let i = 0; i < pp.length; i++) {
-    if (pp[i].startsWith(":")) params[pp[i].slice(1)] = decodeURIComponent(ap[i]);
-    else if (pp[i] !== ap[i]) return null;
+    if (pp[i].startsWith(":")) {
+      try {
+        params[pp[i].slice(1)] = decodeURIComponent(ap[i]);
+      } catch {
+        return null; // malformed percent-encoding
+      }
+    } else if (pp[i] !== ap[i]) return null;
   }
   return params;
 }
@@ -165,7 +187,7 @@ function gracefulShutdown(srv) {
  */
 
 /**
- * @typedef {{ shutdown: () => Promise<void> }} ServerHandle
+ * @typedef {{ scheme: "http"|"https", shutdown: () => Promise<void> }} ServerHandle
  */
 
 /**
@@ -173,7 +195,7 @@ function gracefulShutdown(srv) {
  *
  * @param {{ port: number, token: string, tls: boolean, routes: RouteMap,
  *           health?: import('./health') }} opts
- * @returns {{ scheme: "http"|"https", shutdown: () => Promise<void> }}
+ * @returns {ServerHandle}
  */
 function serve({ port, token, tls, routes, health }) {
   const publicRoutes = routes.public || [];
@@ -240,7 +262,7 @@ function serve({ port, token, tls, routes, health }) {
         if (method !== req.method) continue;
         const params = match(pattern, path);
         if (!params) continue;
-        const body = method === "POST" ? await readBody(req) : {};
+        const body = BODY_METHODS.has(method) ? await readBody(req) : {};
         const data = await fn(body, params, { req, res, url, ip });
         if (data === undefined) return;
         return send(200, { ok: true, data });
@@ -260,6 +282,15 @@ function serve({ port, token, tls, routes, health }) {
       )
     : http.createServer(handler);
 
+  // Slowloris hardening — headers must complete promptly.  (requestTimeout
+  // stays at the Node default so long speedtest streams are not cut off.)
+  srv.headersTimeout = 20_000;
+
+  srv.on("error", (e) => {
+    log.err(`control API failed to bind tcp/${port} — ${e.message}`);
+    process.exit(1); // systemd Restart=always will retry with a clean state
+  });
+
   srv.listen(port, "0.0.0.0");
   const scheme = tls ? "https" : "http";
 
@@ -269,4 +300,4 @@ function serve({ port, token, tls, routes, health }) {
   };
 }
 
-module.exports = { serve, match, rateLimited };
+module.exports = { serve, match, rateLimited, authed };

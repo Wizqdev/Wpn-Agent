@@ -6,9 +6,12 @@ Wants=network-online.target
 
 [Service]
 Environment=WPN_AGENT_PORT=44664
+EnvironmentFile=-/etc/wpn-agent/agent.env
 ExecStart=/usr/bin/node /opt/wpn-agent/bin/wpn-agent
 Restart=always
 RestartSec=3
+ProtectHome=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target

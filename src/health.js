@@ -3,6 +3,12 @@
  * {@link POLL_MS} milliseconds and performs a self-healing restart if it is
  * found to be down.
  *
+ * Two failure modes are healed:
+ *  1. **Interface down** → `wg-quick up <wgConf>` (bounded retries).
+ *  2. **NAT/forward rules flushed** (docker restart, manual `iptables -F`)
+ *     while the interface stays up → rules are re-asserted every poll via
+ *     {@link firewall.ensureLiveNat}, which is a no-op when nothing is missing.
+ *
  * The monitor runs on an `unref()`-ed timer so it never prevents the process
  * from exiting cleanly.  Health status is exposed via {@link status} and
  * surfaced in the `/health` API endpoint so load balancers and dashboards get
@@ -12,16 +18,19 @@
 "use strict";
 
 const { tryRun, log } = require("./util");
+const firewall = require("./firewall");
 
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
-/** How often to poll wg0 (ms). */
+/** How often to poll the WireGuard interface (ms). */
 const POLL_MS = 30_000;
 
 /** Maximum consecutive self-heal failures before giving up and logging loudly. */
 const MAX_HEAL_ATTEMPTS = 5;
+
+const WG_IFACE = process.env.WPN_WG_IFACE || "wg0";
 
 // ---------------------------------------------------------------------------
 // State
@@ -42,17 +51,22 @@ const _state = {
 /** @type {NodeJS.Timeout|null} */
 let _timer = null;
 
+/** Re-entrancy guard — a slow heal must not overlap the next tick. */
+let _busy = false;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 /**
- * Check whether `wg0` appears in the live WireGuard interface list.
+ * Check whether the WG interface appears in the live interface list.
  *
- * @returns {boolean}
+ * @returns {Promise<boolean>}
  */
-function isWgUp() {
-  return (tryRun("wg show interfaces") || "").split(/\s+/).includes("wg0");
+async function isWgUp() {
+  return (await tryRun("wg show interfaces") || "")
+    .split(/\s+/)
+    .includes(WG_IFACE);
 }
 
 // ---------------------------------------------------------------------------
@@ -63,42 +77,59 @@ function isWgUp() {
  * Start the background health monitor.  Safe to call multiple times — only
  * one timer is ever active.
  *
- * @param {string} wgConf - Path to `wg0.conf` (used to bring the interface up
- *   on self-heal: `wg-quick up <wgConf>`).
+ * @param {{ wgConf: string, wanIf: string }} opts
+ *   `wgConf` — path to the conf used to bring the interface up on self-heal.
+ *   `wanIf`  — WAN interface; used to re-assert NAT rules that may have been
+ *              flushed by other tooling while wg0 stayed up.
  * @returns {() => void} Stop function — call it during graceful shutdown.
  */
-function start(wgConf) {
+function start({ wgConf, wanIf }) {
   if (_timer) return () => clearInterval(_timer);
 
-  _timer = setInterval(() => {
+  _timer = setInterval(async () => {
+    if (_busy) return; // previous heal still running — skip this tick
+    _busy = true;
     _state.lastCheck = Date.now();
 
-    if (isWgUp()) {
-      if (!_state.up) log.ok("wg0 is back up");
-      _state.up           = true;
-      _state.healAttempts = 0;
-      _state.lastError    = null;
-      return;
-    }
+    try {
+      const up = await isWgUp();
 
-    _state.up = false;
-    _state.healAttempts++;
+      if (up) {
+        if (!_state.up) log.ok(`${WG_IFACE} is back up`);
+        _state.up           = true;
+        _state.healAttempts = 0;
+        _state.lastError    = null;
 
-    if (_state.healAttempts > MAX_HEAL_ATTEMPTS) {
-      log.err(`wg0 is DOWN — ${_state.healAttempts} heal attempts failed; manual intervention required`);
-      return;
-    }
+        // Re-assert NAT/clamp rules — heals iptables flushes that leave the
+        // interface up.  Idempotent: a no-op when nothing is missing.
+        try {
+          const added = await firewall.ensureLiveNat(wanIf, WG_IFACE);
+          if (added) log.warn("nat/forward rules were missing — re-asserted");
+        } catch {}
+        return;
+      }
 
-    log.warn(`wg0 is DOWN — self-heal attempt ${_state.healAttempts}/${MAX_HEAL_ATTEMPTS}`);
-    tryRun(`wg-quick up ${wgConf}`);
+      _state.up = false;
+      _state.healAttempts++;
 
-    if (isWgUp()) {
-      _state.up        = true;
-      _state.lastError = null;
-      log.ok(`wg0 self-healed (attempt ${_state.healAttempts})`);
-    } else {
-      _state.lastError = `wg-quick up failed at ${new Date().toISOString()}`;
-      log.err(`wg0 self-heal attempt ${_state.healAttempts} failed`);
+      if (_state.healAttempts > MAX_HEAL_ATTEMPTS) {
+        log.err(`${WG_IFACE} is DOWN — ${_state.healAttempts} heal attempts failed; manual intervention required`);
+        return;
+      }
+
+      log.warn(`${WG_IFACE} is DOWN — self-heal attempt ${_state.healAttempts}/${MAX_HEAL_ATTEMPTS}`);
+      await tryRun(`wg-quick up ${wgConf}`);
+
+      if (await isWgUp()) {
+        _state.up        = true;
+        _state.lastError = null;
+        log.ok(`${WG_IFACE} self-healed (attempt ${_state.healAttempts})`);
+      } else {
+        _state.lastError = `wg-quick up failed at ${new Date().toISOString()}`;
+        log.err(`${WG_IFACE} self-heal attempt ${_state.healAttempts} failed`);
+      }
+    } finally {
+      _busy = false;
     }
   }, POLL_MS);
 
