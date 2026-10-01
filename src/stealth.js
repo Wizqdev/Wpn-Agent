@@ -14,10 +14,11 @@
 "use strict";
 
 const fs     = require("fs");
+const os     = require("os");
 const path   = require("path");
 const crypto = require("crypto");
 const net    = require("net");
-const { run, tryRun, log } = require("./util");
+const { runBin, tryRunBin, log } = require("./util");
 
 // ---------------------------------------------------------------------------
 // Pinned release — bump deliberately, never float.
@@ -83,27 +84,39 @@ async function install() {
     throw new Error(`no wstunnel build for ${process.platform}/${process.arch}`);
   }
 
-  const tmp = `/tmp/wstunnel-${WST_VERSION}.tar.gz`;
-  const dl = await tryRun(`curl -fsSL -o ${tmp} ${BASE_URL}/${asset.file} || wget -qO ${tmp} ${BASE_URL}/${asset.file}`);
-  if (dl === null || !fs.existsSync(tmp)) throw new Error("download failed");
+  // Private (0700) temp dir — a predictable /tmp path is a symlink-race target
+  // for a root process.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wstunnel-"));
+  const tmp = path.join(dir, asset.file);
+  try {
+    const url = `${BASE_URL}/${asset.file}`;
+    try {
+      await runBin("curl", ["-fsSL", "-o", tmp, url]);
+    } catch {
+      await runBin("wget", ["-qO", tmp, url]).catch(() => {});
+    }
+    if (!fs.existsSync(tmp)) throw new Error("download failed");
 
-  const got = sha256(tmp);
-  if (got !== asset.sha256) {
-    fs.unlinkSync(tmp);
-    throw new Error(`sha256 mismatch: ${got.slice(0, 12)}… ≠ pinned`);
+    const got = sha256(tmp);
+    if (got !== asset.sha256) {
+      throw new Error(`sha256 mismatch: ${got.slice(0, 12)}… ≠ pinned`);
+    }
+
+    // Secondary verification against upstream checksums.txt.
+    const sumsUrl = `${BASE_URL}/checksums.txt`;
+    const sums =
+      (await tryRunBin("curl", ["-fsSL", sumsUrl])) ||
+      (await tryRunBin("wget", ["-qO-", sumsUrl]));
+    if (sums && !sums.includes(`${asset.sha256}  ${asset.file}`)) {
+      throw new Error("release checksums.txt disagrees with pinned hash");
+    }
+
+    fs.mkdirSync(path.dirname(BIN), { recursive: true });
+    await runBin("tar", ["-xzf", tmp, "-C", path.dirname(BIN), "wstunnel"]);
+    fs.chmodSync(BIN, 0o755);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
-
-  // Secondary verification against upstream checksums.txt.
-  const sums = await tryRun(`curl -fsSL ${BASE_URL}/checksums.txt || wget -qO- ${BASE_URL}/checksums.txt`);
-  if (sums && !sums.includes(`${asset.sha256}  ${asset.file}`)) {
-    fs.unlinkSync(tmp);
-    throw new Error("release checksums.txt disagrees with pinned hash");
-  }
-
-  fs.mkdirSync(path.dirname(BIN), { recursive: true });
-  await run(`tar -xzf ${tmp} -C ${path.dirname(BIN)} wstunnel`);
-  fs.chmodSync(BIN, 0o755);
-  fs.unlinkSync(tmp);
 }
 
 /**
@@ -142,8 +155,84 @@ function canBind(port) {
 }
 
 /**
+ * Render the `wpn-stealth` systemd unit.
+ *
+ * @param {{ bin: string, port: number, key: string, wgPort: number }} o
+ * @returns {string}
+ */
+function renderUnit({ bin, port, key, wgPort }) {
+  const execArgs =
+    `server wss://0.0.0.0:${port}` +
+    ` --restrict-to 127.0.0.1:${wgPort}` +
+    ` --restrict-http-upgrade-path-prefix ${key}`;
+  return [
+    "[Unit]",
+    "Description=Wpn stealth transport (wstunnel)",
+    "After=network-online.target wpn-agent.service",
+    "Wants=network-online.target",
+    "",
+    "[Service]",
+    `ExecStart=${bin} ${execArgs}`,
+    "Restart=always",
+    "RestartSec=3",
+    "ProtectHome=true",
+    "PrivateTmp=true",
+    "NoNewPrivileges=true",
+    "",
+    "[Install]",
+    "WantedBy=multi-user.target",
+    "",
+  ].join("\n");
+}
+
+/**
+ * Port the existing unit file is configured to listen on, if any.
+ *
+ * @param {string} unitPath
+ * @returns {number|null}
+ */
+function readUnitPort(unitPath) {
+  try {
+    const m = fs.readFileSync(unitPath, "utf8").match(/server wss:\/\/0\.0\.0\.0:(\d+)/);
+    return m ? parseInt(m[1], 10) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** @param {number} port @returns {Promise<boolean>} true if something accepts TCP on 127.0.0.1:port. */
+const tcpConnect = (port) =>
+  new Promise((resolve) => {
+    const s = net.connect({ port, host: "127.0.0.1" });
+    const done = (ok) => { s.destroy(); resolve(ok); };
+    s.setTimeout(1_000, () => done(false));
+    s.once("connect", () => done(true));
+    s.once("error",   () => done(false));
+  });
+
+/**
+ * Wait for the relay to accept connections (it may take a moment to bind
+ * after systemd reports `active`).
+ *
+ * @param {number} port
+ * @param {number} [tries]
+ * @returns {Promise<boolean>}
+ */
+async function probe(port, tries = 6) {
+  for (let i = 0; i < tries; i++) {
+    if (await tcpConnect(port)) return true;
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  return false;
+}
+
+/**
  * Select the stealth port — try each candidate in order until a real bind
  * succeeds.  `WPN_STEALTH_PORT` overrides both.
+ *
+ * NOTE: probe-then-close is inherently racy — another process can grab the
+ * port before wstunnel binds it.  `ensure()` therefore verifies the unit is
+ * active AND listening after start rather than trusting this pick.
  *
  * @param {number[]} [candidates] - Defaults to [443, 8443].  Injectable for
  *   tests (privileged ports need root).
@@ -172,61 +261,72 @@ async function pickPort(candidates = [443, 8443]) {
  * Install and start the `wstunnel` stealth relay.  Never throws; failures
  * are returned as `{ enabled: false, error }`.
  *
- * After enabling the unit on Linux, the service state is verified — a port
- * conflict or binary failure would otherwise leave stealth advertised as
- * enabled while the relay is dead.
+ * Restart-safe: when the unit is already running, its configured port is
+ * reused (re-probing would find the port busy — held by wstunnel itself —
+ * and wrongly fall back to 8443 while the relay stays on 443).  A changed
+ * unit file triggers an explicit `restart`.  On Linux the relay must be
+ * `active` AND accepting TCP on the advertised port before `enabled: true`
+ * is reported.
  *
  * @param {string} dir - Agent identity directory.
  * @param {{ wgPort: number }} opts
+ * @param {{ platform?: string, unit?: string, bin?: string, candidates?: number[],
+ *           settleMs?: number, probe?: (port: number) => Promise<boolean> }} [deps]
+ *   Test hooks; production callers omit this.
  * @returns {Promise<StealthState>}
  */
-async function ensure(dir, { wgPort }) {
+async function ensure(dir, { wgPort }, deps = {}) {
   if (process.env.WPN_STEALTH === "0") return { enabled: false };
+  const platform = deps.platform || process.platform;
+  const unitPath = deps.unit || UNIT;
+  const bin      = deps.bin  || BIN;
   try {
-    if (!fs.existsSync(BIN)) {
+    if (!fs.existsSync(bin)) {
       log.info("stealth: installing wstunnel…");
       await install();
     }
 
-    const key  = stealthKey(dir);
-    const port = await pickPort();
+    const key   = stealthKey(dir);
+    const linux = platform === "linux";
+    const isActive = async () =>
+      (await tryRunBin("systemctl", ["is-active", "wpn-stealth"])) === "active";
 
-    if (process.platform === "linux") {
-      const execArgs =
-        `server wss://0.0.0.0:${port}` +
-        ` --restrict-to 127.0.0.1:${wgPort}` +
-        ` --restrict-http-upgrade-path-prefix ${key}`;
-      fs.writeFileSync(
-        UNIT,
-        [
-          "[Unit]",
-          "Description=Wpn stealth transport (wstunnel)",
-          "After=network-online.target wpn-agent.service",
-          "Wants=network-online.target",
-          "",
-          "[Service]",
-          `ExecStart=${BIN} ${execArgs}`,
-          "Restart=always",
-          "RestartSec=3",
-          "ProtectHome=true",
-          "PrivateTmp=true",
-          "",
-          "[Install]",
-          "WantedBy=multi-user.target",
-          "",
-        ].join("\n")
-      );
-      await tryRun("systemctl daemon-reload");
-      await tryRun("systemctl enable --now wpn-stealth");
+    const existingPort = linux ? readUnitPort(unitPath) : null;
+    const wasActive    = existingPort !== null && (await isActive());
+    const port =
+      wasActive && !process.env.WPN_STEALTH_PORT
+        ? existingPort
+        : await pickPort(deps.candidates);
+
+    if (linux) {
+      const unit = renderUnit({ bin, port, key, wgPort });
+      const prev = fs.existsSync(unitPath) ? fs.readFileSync(unitPath, "utf8") : null;
+      const changed = prev !== unit;
+      if (changed) {
+        // The unit embeds the path-prefix secret — keep it root-only.
+        fs.writeFileSync(unitPath, unit, { mode: 0o600 });
+        fs.chmodSync(unitPath, 0o600);
+        await tryRunBin("systemctl", ["daemon-reload"]);
+      }
+      await tryRunBin("systemctl", ["enable", "--now", "wpn-stealth"]);
+      // `enable --now` does not restart a running unit — do it explicitly so
+      // a changed port/key actually takes effect.
+      if (changed && wasActive) await tryRunBin("systemctl", ["restart", "wpn-stealth"]);
 
       // Verify the relay actually started — bind failure/crash shouldn't be
       // advertised as "enabled" to the control plane.
-      await new Promise((r) => setTimeout(r, 800)); // let it bind/crash
-      const active = await tryRun("systemctl is-active wpn-stealth");
+      await new Promise((r) => setTimeout(r, deps.settleMs ?? 800)); // let it bind/crash
+      const active = await tryRunBin("systemctl", ["is-active", "wpn-stealth"]);
       if (active !== "active") {
         return {
           enabled: false,
           error: `wpn-stealth unit is ${active || "unknown"} (check journalctl -u wpn-stealth)`,
+        };
+      }
+      if (!(await (deps.probe || probe)(port))) {
+        return {
+          enabled: false,
+          error: `wpn-stealth is active but nothing is listening on tcp/${port} (check journalctl -u wpn-stealth)`,
         };
       }
     }
@@ -238,4 +338,4 @@ async function ensure(dir, { wgPort }) {
   }
 }
 
-module.exports = { ensure, pickPort, canBind, BIN, WST_VERSION };
+module.exports = { ensure, pickPort, canBind, readUnitPort };
