@@ -20,7 +20,10 @@ stdlib), Node 18+ required, must run as root on Linux.
   preferred) or `util.run` (shell string, only when pipes/redirects needed).
   Never `execSync`/`execFileSync` — they block the event loop.
 - `wg0.conf` mutations must go through `confLock` (`src/lock.js`) and the
-  pure helpers `_upsertPeerConf` / `_removePeerFromConf` in `src/wireguard.js`.
+  pure helpers `upsertPeerConf` / `removePeerFromConf` in `src/wireguard.js`.
+  `addPeer`/`removePeer` hold the lock across the full validate → `wg set` →
+  persist sequence and roll back the live change if the persist fails; the
+  conf write itself is atomic (temp file + fsync + rename).
 - Firewall rules live in `src/firewall.js` as fragments with detection `key`s;
   iptables and nftables (`inet wpn` table) backends must stay in sync.
 - Files under `/etc/wpn-agent` are identity material — never delete them on
@@ -33,5 +36,10 @@ stdlib), Node 18+ required, must run as root on Linux.
 - `wg show <iface> dump` emits 8-field peer lines; `wg show all dump` emits
   9-field (iface-prefixed) lines — `_parseDump` handles both.
 - Peer addresses must be inside `WPN_SUBNET_V4`/`WPN_SUBNET_V6` and not equal
-  to the server address — enforced by `_addrInSubnet` in `addPeer`.
+  to the server address — enforced by `addrInSubnet` in `addPeer`.
+- `POST /update` is disabled unless `WPN_ALLOW_REMOTE_UPDATE=1`; signed
+  upstream commits can be required with `WPN_UPDATE_REQUIRE_SIGNED=1`.
+- `systemd/wpn-agent.service` is generated from the template in
+  `src/service.js` — run `npm run gen:unit` after changing it (a test fails
+  on drift).
 - wstunnel is pinned by version + SHA-256; bump `WST_VERSION` deliberately.

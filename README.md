@@ -109,7 +109,7 @@ All routes except `GET /health` require `Authorization: Bearer <agent-key>`.
 | `DELETE /peers` | ✓ | `{ publicKey }` — remove a peer (body form; simplest) |
 | `DELETE /peers/:key` | ✓ | Remove a peer by public key — **URL-encode the key** (`encodeURIComponent`); base64 keys may contain `/` and `=` |
 | `GET /capabilities` | ✓ | Feature flags (stealth, echo port, wg version) |
-| `POST /update` | ✓ | `git pull --ff-only` + systemd restart |
+| `POST /update` | ✓ | Fast-forward update + restart — **disabled by default**; requires `WPN_ALLOW_REMOTE_UPDATE=1` (optionally `WPN_UPDATE_REQUIRE_SIGNED=1` to verify the upstream commit) |
 | `GET /speedtest` | — | Bandwidth probe (public, rate-limited to 4 req/min/IP, max 8 MiB) |
 
 Peers are applied live (`wg set`) **and** persisted to `wg0.conf` so they
@@ -131,6 +131,8 @@ survive reboots.
 | `WPN_SUBNET_V4` | `10.66.0.1/24` | Tunnel IPv4 subnet (server address/prefix) |
 | `WPN_SUBNET_V6` | `fd00:66::1/64` | Tunnel IPv6 subnet |
 | `WPN_LOG_JSON` | `0` | Set to `1` for newline-delimited JSON logs |
+| `WPN_ALLOW_REMOTE_UPDATE` | `0` | Set to `1` to enable `POST /update` (root-level code update — off by default) |
+| `WPN_UPDATE_REQUIRE_SIGNED` | `0` | Set to `1` to require `git verify-commit` on the fetched commit before merging |
 
 On systemd installs, put overrides in `/etc/wpn-agent/agent.env`
 (`EnvironmentFile=` is wired into the unit), then `systemctl restart wpn-agent`.
@@ -152,7 +154,12 @@ On systemd installs, put overrides in `/etc/wpn-agent/agent.env`
 - **Peer validation** — `POST /peers` rejects malformed keys/addresses,
   addresses outside the tunnel subnet, the server's own address, and IPs
   already claimed by another peer (checked against both the live interface
-  and `wg0.conf`).
+  and `wg0.conf`).  Claim-check, `wg set`, and config persist run inside a
+  single mutex so concurrent requests cannot double-assign a tunnel IP; a
+  conflict returns `409` rather than a generic error.
+- **Config durability** — `wg0.conf` writes are atomic (temp file, fsync,
+  rename, dir fsync), and a persist failure rolls back the live `wg set`
+  so runtime state and on-disk state never silently diverge.
 - **Rate limiting** — 120 authenticated requests/minute per IP; `/speedtest`
   is additionally capped at 4 requests/minute with an 8 MiB payload ceiling;
   the UDP echo reflector drops packets over 64 B and 200 pps per source so it
@@ -165,7 +172,12 @@ On systemd installs, put overrides in `/etc/wpn-agent/agent.env`
   against both a hardcoded hash and the upstream `checksums.txt` before
   installation.
 - **Audit trail** — peer add/remove operations are logged with source IP and
-  (truncated) pubkey via the agent log.
+  (truncated) pubkey via the agent log; failed auth attempts are logged with
+  source IP; update attempts are audited with before/after commit hashes.
+- **Remote update off by default** — `POST /update` performs a root-level
+  `git pull` + restart, so it returns `403` unless the operator opts in with
+  `WPN_ALLOW_REMOTE_UPDATE=1`; `WPN_UPDATE_REQUIRE_SIGNED=1` additionally
+  requires the fetched commit to pass `git verify-commit` before merging.
 
 ---
 

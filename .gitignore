@@ -15,3 +15,6 @@ data/
 .vscode/
 *.swp
 *.swo
+
+# Local agent tooling state
+.devin/
