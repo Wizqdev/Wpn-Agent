@@ -41,55 +41,102 @@ pkg_install() {
   fi
 }
 
-NODE_MIN=18
+NODE_MIN=22
 
-install_node() {
-  log_info "installing Node.js ${NODE_MIN}.x via NodeSource…"
+fetch_script() {
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "https://deb.nodesource.com/setup_${NODE_MIN}.x" | bash -
+    curl -fsSL "$1"
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO- "https://deb.nodesource.com/setup_${NODE_MIN}.x" | bash -
+    wget -qO- "$1"
   else
     log_err "neither curl nor wget found — install Node.js ${NODE_MIN}+ manually"
     exit 1
   fi
+}
 
-  if ! pkg_install nodejs; then
+install_node() {
+  log_info "installing Node.js ${NODE_MIN}.x…"
+  if command -v apt-get >/dev/null 2>&1; then
+    fetch_script "https://deb.nodesource.com/setup_${NODE_MIN}.x" | bash -
+    pkg_install nodejs
+  elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+    fetch_script "https://rpm.nodesource.com/setup_${NODE_MIN}.x" | bash -
+    pkg_install nodejs
+  elif command -v pacman >/dev/null 2>&1; then
+    pkg_install nodejs npm
+  elif command -v zypper >/dev/null 2>&1; then
+    pkg_install "nodejs${NODE_MIN}"
+  else
     log_err "no supported package manager — install Node.js ${NODE_MIN}+ manually"
     exit 1
   fi
 }
 
-if ! command -v node >/dev/null 2>&1; then
+node_major() {
+  node -e 'process.stdout.write(process.versions.node.split(".")[0])' 2>/dev/null || echo 0
+}
+
+if ! command -v node >/dev/null 2>&1 || [[ "$(node_major)" -lt "$NODE_MIN" ]]; then
+  if command -v node >/dev/null 2>&1; then
+    log_warn "Node.js $(node_major) is too old — upgrading to ${NODE_MIN}.x"
+  fi
   install_node
 fi
 
-NODE_MAJOR="$(node -e 'process.stdout.write(process.versions.node.split(".")[0])')"
-if [[ "$NODE_MAJOR" -lt "$NODE_MIN" ]]; then
-  log_warn "Node.js ${NODE_MAJOR} is too old — upgrading to ${NODE_MIN}.x"
-  install_node
+if [[ "$(node_major)" -lt "$NODE_MIN" ]]; then
+  log_err "Node.js ${NODE_MIN}+ is required but $(node --version 2>/dev/null || echo 'none') is installed"
+  exit 1
 fi
 
 log_ok "node $(node --version)"
 
-if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "bash" ]]; then
-  SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-else
-  REPO_URL="https://github.com/Wizqdev/Wpn-Agent.git"
+is_agent_tree() {
+  [[ -f "$1/bin/wpn-agent" && -f "$1/src/agent.js" ]]
+}
+
+SRC=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+  CANDIDATE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if is_agent_tree "$CANDIDATE"; then
+    SRC="$CANDIDATE"
+  fi
+fi
+
+if [[ -z "$SRC" ]]; then
+  REPO_URL="${WPN_REPO_URL:-https://github.com/Wizqdev/Wpn-Agent.git}"
   CLONE_DIR="$(mktemp -d)"
-  log_info "piped install detected — cloning ${REPO_URL}…"
+  trap 'rm -rf "$CLONE_DIR"' EXIT
+  log_info "no agent source next to this script — cloning ${REPO_URL}…"
   if ! command -v git >/dev/null 2>&1; then
     pkg_install git || { log_err "git not found — install it manually"; exit 1; }
   fi
   git clone --depth 1 "$REPO_URL" "$CLONE_DIR"
+  if ! is_agent_tree "$CLONE_DIR"; then
+    log_err "cloned repository is missing bin/wpn-agent or src/agent.js"
+    exit 1
+  fi
   SRC="$CLONE_DIR"
 fi
 
 DEST="/opt/wpn-agent"
 if [[ "$SRC" != "$DEST" ]]; then
-  mkdir -p "$DEST"
-  cp -a "$SRC/." "$DEST/"
-  chmod +x "$DEST/bin/wpn-agent"
+  STAGE="${DEST}.new"
+  rm -rf "$STAGE"
+  mkdir -p "$STAGE"
+  cp -a "$SRC/." "$STAGE/"
+  if ! is_agent_tree "$STAGE"; then
+    rm -rf "$STAGE"
+    log_err "staged copy is incomplete — leaving ${DEST} untouched"
+    exit 1
+  fi
+  if [[ -f "$DEST/bin/wstunnel" ]]; then
+    cp -a "$DEST/bin/wstunnel" "$STAGE/bin/wstunnel"
+  fi
+  chmod +x "$STAGE/bin/wpn-agent"
+  rm -rf "${DEST}.old"
+  [[ -d "$DEST" ]] && mv "$DEST" "${DEST}.old"
+  mv "$STAGE" "$DEST"
+  rm -rf "${DEST}.old"
   log_ok "agent deployed to ${DEST}"
 fi
 

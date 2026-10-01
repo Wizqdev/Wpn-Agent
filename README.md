@@ -5,7 +5,7 @@
 > `wg0` with NAT + forwarding, and serves a small HTTPS control API that the
 > Wpn API calls to add/remove user peers.
 
-**Zero npm dependencies — pure Node.js stdlib.  Requires Node.js 18+.**
+**Zero npm dependencies — pure Node.js stdlib.  Requires Node.js 22+.**
 
 ## Requirements
 
@@ -13,7 +13,7 @@
 |---|---|
 | OS | Linux with systemd (Debian/Ubuntu, Fedora/RHEL, Arch, openSUSE) |
 | Privileges | root (the agent manages `wg0`, firewall rules and `sysctl`) |
-| Runtime | Node.js 18+ (installed automatically by `install.sh` if missing) |
+| Runtime | Node.js 22+ (installed automatically by `install.sh` if missing) |
 | Network | Public IPv4; open `udp/51820` and `tcp/44664` in your cloud firewall |
 
 ---
@@ -25,7 +25,7 @@ curl -fsSL https://raw.githubusercontent.com/Wizqdev/Wpn-Agent/main/install.sh |
 ```
 
 This single command:
-1. Installs Node.js 18+ if missing (or upgrades an older version)
+1. Installs Node.js 22 if missing (or upgrades an older version)
 2. Clones the repo and deploys it to `/opt/wpn-agent`
 3. Opens the required ports in `ufw` (if installed)
 4. Registers and starts the `wpn-agent` systemd service

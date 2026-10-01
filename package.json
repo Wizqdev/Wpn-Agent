@@ -15,7 +15,7 @@
     "gen:unit":        "node scripts/gen-unit.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "license": "UNLICENSED"
 }

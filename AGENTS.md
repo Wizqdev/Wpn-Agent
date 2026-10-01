@@ -1,7 +1,7 @@
 # Wpn Agent — agent notes
 
 Self-bootstrapping WireGuard node agent. Zero npm dependencies (pure Node.js
-stdlib), Node 18+ required, must run as root on Linux.
+stdlib), Node 22+ required, must run as root on Linux.
 
 ## Commands
 
