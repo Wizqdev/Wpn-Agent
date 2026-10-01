@@ -290,20 +290,42 @@ function upsertPeerConf(conf, { publicKey, address, allowedIps }) {
   );
 }
 
-function validatePeerAddrs(addrs) {
-  const serverV4 = SUBNET_V4.split("/")[0];
-  const serverV6 = normAddr(SUBNET_V6.split("/")[0]);
+function confAddresses() {
+  try {
+    const m = fs.readFileSync(WG_CONF, "utf8").match(/^\s*Address\s*=\s*(.+)$/m);
+    return m ? m[1].split(",").map((s) => s.trim()).filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function tunnelNets() {
+  const cfg = confAddresses();
+  const [live4, live6] = await Promise.all([
+    tryRun(`ip -o -4 addr show dev ${WG_IFACE} | awk '{print $4; exit}'`),
+    tryRun(`ip -o -6 addr show dev ${WG_IFACE} scope global | awk '{print $4; exit}'`),
+  ]);
+  return {
+    v4: live4 || cfg.find((a) => !a.includes(":")) || SUBNET_V4,
+    v6: live6 || cfg.find((a) => a.includes(":")) || SUBNET_V6,
+  };
+}
+
+async function validatePeerAddrs(addrs) {
+  const nets     = await tunnelNets();
+  const serverV4 = nets.v4.split("/")[0];
+  const serverV6 = normAddr(nets.v6.split("/")[0]);
 
   for (const a of addrs) {
     const isV6 = a.includes(":");
     if (isV6 ? !expandIPv6(a) : !isValidIPv4(a)) {
       throw httpErr(400, `address ${a} is not a valid IPv4 or IPv6 address`);
     }
-    if (!addrInSubnet(a, isV6 ? SUBNET_V6 : SUBNET_V4)) {
+    if (!addrInSubnet(a, isV6 ? nets.v6 : nets.v4)) {
       throw httpErr(
         400,
         `address ${a} is outside the node subnet ` +
-          `(${isV6 ? SUBNET_V6 : SUBNET_V4})`
+          `(${isV6 ? nets.v6 : nets.v4})`
       );
     }
     if (normAddr(a) === (isV6 ? serverV6 : serverV4)) {
@@ -373,7 +395,7 @@ async function addPeer(publicKey, address) {
   }
 
   const addrs = address.split(",").map((a) => a.trim()).filter(Boolean);
-  validatePeerAddrs(addrs);
+  await validatePeerAddrs(addrs);
 
   const allowedIps = addrs
     .map((a) => (a.includes(":") ? `${a}/128` : `${a}/32`))
