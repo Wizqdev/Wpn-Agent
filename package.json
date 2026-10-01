@@ -11,7 +11,8 @@
     "print":           "node bin/wpn-agent --print",
     "install-service": "node bin/wpn-agent --install",
     "dev":             "node bin/wpn-agent --skip-wg",
-    "test":            "node --test test/*.test.js"
+    "test":            "node --test test/*.test.js",
+    "gen:unit":        "node scripts/gen-unit.js"
   },
   "engines": {
     "node": ">=18"

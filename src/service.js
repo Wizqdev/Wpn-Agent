@@ -17,7 +17,7 @@
 
 const fs   = require("fs");
 const path = require("path");
-const { run, tryRun, log } = require("./util");
+const { runBin, tryRunBin, log } = require("./util");
 
 const DEST       = "/opt/wpn-agent";
 const UNIT       = "/etc/systemd/system/wpn-agent.service";
@@ -26,6 +26,57 @@ const SYSCTL     = "/etc/sysctl.d/99-wpn.conf";
 const WG_IFACE   = process.env.WPN_WG_IFACE || "wg0";
 const WG_CONF    = `/etc/wireguard/${WG_IFACE}.conf`;
 const ENV_FILE   = `${process.env.WPN_AGENT_DIR || "/etc/wpn-agent"}/agent.env`;
+
+/**
+ * Render the wpn-agent systemd unit.  Single source of truth: used by
+ * {@link install} and by {@link referenceUnit} (the checked-in
+ * `systemd/wpn-agent.service`), so the two can never drift apart.
+ *
+ * @param {{ agentPort: number, execStart?: string, envFile?: string }} opts
+ * @returns {string}
+ */
+function renderUnit({
+  agentPort,
+  execStart = `${process.execPath} ${DEST}/bin/wpn-agent`,
+  envFile   = ENV_FILE,
+}) {
+  return [
+    "[Unit]",
+    "Description=Wpn WireGuard node agent",
+    "After=network-online.target",
+    "Wants=network-online.target",
+    "",
+    "[Service]",
+    `Environment=WPN_AGENT_PORT=${agentPort}`,
+    // Optional operator overrides — see .env.example for the full list.
+    `EnvironmentFile=-${envFile}`,
+    `ExecStart=${execStart}`,
+    "Restart=always",
+    "RestartSec=3",
+    // Light sandboxing that does not impede net-admin duties.
+    "ProtectHome=true",
+    "PrivateTmp=true",
+    "NoNewPrivileges=true",
+    "",
+    "[Install]",
+    "WantedBy=multi-user.target",
+    "",
+  ].join("\n");
+}
+
+/**
+ * Exact contents of the checked-in `systemd/wpn-agent.service`.  Regenerate
+ * with `npm run gen:unit`; a test fails if the file drifts from the template.
+ *
+ * @returns {string}
+ */
+const referenceUnit = () =>
+  "# Reference unit — `wpn-agent --install` writes this itself.\n" +
+  renderUnit({
+    agentPort: 44664,
+    execStart: "/usr/bin/node /opt/wpn-agent/bin/wpn-agent",
+    envFile:   "/etc/wpn-agent/agent.env",
+  });
 
 /**
  * Deploy the agent to `/opt/wpn-agent` and register it as a systemd service.
@@ -48,35 +99,12 @@ async function install(agentPort) {
     fs.chmodSync(path.join(DEST, "bin", "wpn-agent"), 0o755);
   }
 
-  fs.writeFileSync(
-    UNIT,
-    [
-      "[Unit]",
-      "Description=Wpn WireGuard node agent",
-      "After=network-online.target",
-      "Wants=network-online.target",
-      "",
-      "[Service]",
-      `Environment=WPN_AGENT_PORT=${agentPort}`,
-      // Optional operator overrides — see .env.example for the full list.
-      `EnvironmentFile=-${ENV_FILE}`,
-      `ExecStart=${process.execPath} ${DEST}/bin/wpn-agent`,
-      "Restart=always",
-      "RestartSec=3",
-      // Light sandboxing that does not impede net-admin duties.
-      "ProtectHome=true",
-      "PrivateTmp=true",
-      "",
-      "[Install]",
-      "WantedBy=multi-user.target",
-      "",
-    ].join("\n")
-  );
+  fs.writeFileSync(UNIT, renderUnit({ agentPort }));
 
-  await run("systemctl daemon-reload");
-  await run("systemctl enable wpn-agent");
+  await runBin("systemctl", ["daemon-reload"]);
+  await runBin("systemctl", ["enable", "wpn-agent"]);
   // Use `restart` (not `start`) so an upgrade swaps the running code.
-  await run("systemctl restart wpn-agent");
+  await runBin("systemctl", ["restart", "wpn-agent"]);
 
   log.ok("installed + started as systemd service 'wpn-agent'");
   log.info("logs:  journalctl -u wpn-agent -f");
@@ -98,26 +126,26 @@ async function install(agentPort) {
  */
 async function uninstall() {
   // Control plane + stealth relay.
-  await tryRun("systemctl disable --now wpn-agent");
-  await tryRun("systemctl disable --now wpn-stealth");
+  await tryRunBin("systemctl", ["disable", "--now", "wpn-agent"]);
+  await tryRunBin("systemctl", ["disable", "--now", "wpn-stealth"]);
   fs.rmSync(UNIT,    { force: true });
   fs.rmSync(STEALTH, { force: true });
 
   // Data plane: bring wg0 down (runs PostDown → removes NAT rules), then stop
   // it from ever coming back automatically.
-  if (fs.existsSync(WG_CONF)) await tryRun(`wg-quick down ${WG_CONF}`);
-  await tryRun(`systemctl disable wg-quick@${WG_IFACE}`);
-  await tryRun("nft delete table inet wpn"); // no-op if absent / iptables backend
+  if (fs.existsSync(WG_CONF)) await tryRunBin("wg-quick", ["down", WG_CONF]);
+  await tryRunBin("systemctl", ["disable", `wg-quick@${WG_IFACE}`]);
+  await tryRunBin("nft", ["delete", "table", "inet", "wpn"]); // no-op if absent / iptables backend
 
   // Forwarding drop-in we installed.
   if (fs.existsSync(SYSCTL)) {
     fs.rmSync(SYSCTL, { force: true });
-    await tryRun("sysctl --system -q");
+    await tryRunBin("sysctl", ["--system", "-q"]);
   }
 
-  await tryRun("systemctl daemon-reload");
+  await tryRunBin("systemctl", ["daemon-reload"]);
   fs.rmSync(DEST, { recursive: true, force: true });
   log.ok("service removed + data plane torn down (identity kept in /etc/wpn-agent)");
 }
 
-module.exports = { install, uninstall };
+module.exports = { install, uninstall, renderUnit, referenceUnit };
