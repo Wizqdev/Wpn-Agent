@@ -56,3 +56,82 @@ test("firewall - patchConfNat upgrades an old conf missing the clamp", async () 
   // Existing rules kept, only one MASQUERADE add.
   assert.strictEqual(out.split("MASQUERADE").length - 1 >= 2, true);
 });
+
+// ---------------------------------------------------------------------------
+// ensureLiveNat — explicit check commands, add-if-missing idempotence.
+// ---------------------------------------------------------------------------
+
+const util = require("../src/util");
+const firewall = require("../src/firewall");
+
+/** Fake iptables: tracks the live rule set; -C fails when a rule is absent. */
+function fakeIptables({ failV6 = false } = {}) {
+  const rules = new Set();
+  const adds  = [];
+  const norm  = (cmd) =>
+    cmd.replace(/ -[ACD] /, " -X ").replace(/\s*2>\/dev\/null( \|\| true)?$/, "");
+  util.setRunner({
+    async run(cmd) {
+      if (failV6 && cmd.startsWith("ip6tables")) throw new Error("ip6tables unavailable");
+      if (/ -C /.test(cmd)) {
+        if (rules.has(norm(cmd))) return "";
+        throw new Error("rule missing");
+      }
+      if (/ -A /.test(cmd)) { rules.add(norm(cmd)); adds.push(cmd); return ""; }
+      throw new Error(`unexpected command: ${cmd}`);
+    },
+  });
+  return { rules, adds };
+}
+
+test("firewall - every iptables fragment has an explicit -C check and plain -A add", async () => {
+  const frags = [];
+  // fragments() is internal; reach it through confNatRules' backend contract.
+  const { up } = await confNatRules("eth0", "wg0", "iptables");
+  assert.ok(up.length > 0);
+  util.setRunner({
+    async run(cmd) { frags.push(cmd); throw new Error("force add path"); },
+  });
+  try {
+    await firewall.ensureLiveNat("eth0", "wg0", "iptables");
+  } finally {
+    util.resetRunner();
+  }
+  const checks = frags.filter((c) => / -C /.test(c));
+  const adds   = frags.filter((c) => / -A /.test(c));
+  assert.strictEqual(checks.length, 8, "one -C per fragment");
+  assert.strictEqual(adds.length, 8, "one -A per fragment");
+  for (const c of checks) assert.ok(!/ -A /.test(c), `check must not contain -A: ${c}`);
+});
+
+test("firewall - ensureLiveNat adds each rule exactly once across repeated polls", async () => {
+  const fake = fakeIptables();
+  try {
+    const first  = await firewall.ensureLiveNat("eth0", "wg0", "iptables");
+    const second = await firewall.ensureLiveNat("eth0", "wg0", "iptables");
+    const third  = await firewall.ensureLiveNat("eth0", "wg0", "iptables");
+    assert.deepStrictEqual([first, second, third], [8, 0, 0]);
+    assert.strictEqual(fake.adds.length, 8, "no duplicate appends");
+    assert.strictEqual(fake.rules.size, 8);
+  } finally { util.resetRunner(); }
+});
+
+test("firewall - re-asserts only the rule that was flushed", async () => {
+  const fake = fakeIptables();
+  try {
+    await firewall.ensureLiveNat("eth0", "wg0", "iptables");
+    const masq = [...fake.rules].find((r) => r.startsWith("iptables -t nat -X POSTROUTING"));
+    assert.ok(masq);
+    fake.rules.delete(masq); // something flushed NAT
+    assert.strictEqual(await firewall.ensureLiveNat("eth0", "wg0", "iptables"), 1);
+    assert.strictEqual(fake.rules.size, 8);
+  } finally { util.resetRunner(); }
+});
+
+test("firewall - unavailable ip6tables does not read as 'rules missing' every poll", async () => {
+  fakeIptables({ failV6: true });
+  try {
+    assert.strictEqual(await firewall.ensureLiveNat("eth0", "wg0", "iptables"), 4); // v4 only
+    assert.strictEqual(await firewall.ensureLiveNat("eth0", "wg0", "iptables"), 0);
+  } finally { util.resetRunner(); }
+});

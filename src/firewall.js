@@ -22,7 +22,7 @@
 
 "use strict";
 
-const { tryRun, log } = require("./util");
+const { tryRun, tryRunBin, log } = require("./util");
 
 // ---------------------------------------------------------------------------
 // Detection
@@ -51,11 +51,33 @@ async function backend() {
 // ---------------------------------------------------------------------------
 
 /**
- * @typedef {{ up: string, down: string, key: string }} Fragment
+ * @typedef {{ up: string, down: string, key: string, add?: string, check?: string }} Fragment
  * `key` is a distinctive substring used to detect whether the fragment is
  * already present in a conf file or live ruleset — enables incremental
  * patching of confs written by older agent versions.
+ *
+ * iptables fragments additionally carry `add` (plain append, no shell
+ * suffix) and `check` (the matching `-C` existence test) — built from one
+ * structured definition, never derived from `up` by string surgery.
  */
+
+/**
+ * Build one iptables-family rule from a single definition so its append,
+ * delete and check forms can never disagree.
+ *
+ * @param {"iptables"|"ip6tables"} bin
+ * @param {"filter"|"nat"|"mangle"} table
+ * @param {string} chain
+ * @param {string} spec  - Match + target, e.g. `-i wg0 -j ACCEPT`.
+ * @param {boolean} [soft] - Embed with `|| true` (v6 may be unavailable).
+ * @returns {{ up: string, down: string, add: string, check: string }}
+ */
+function iptRule(bin, table, chain, spec, soft = false) {
+  const t   = table === "filter" ? "" : `-t ${table} `;
+  const cmd = (op) => `${bin} ${t}${op} ${chain} ${spec}`;
+  const wrap = (c) => (soft ? `${c} 2>/dev/null || true` : c);
+  return { up: wrap(cmd("-A")), down: wrap(cmd("-D")), add: cmd("-A"), check: cmd("-C") };
+}
 
 /**
  * Ordered list of rule fragments for a backend.
@@ -67,48 +89,24 @@ async function backend() {
  */
 function fragments(b, wanIf, wgIface) {
   if (b === "iptables") {
-    const v6 = (cmd) => `${cmd} 2>/dev/null || true`;
+    const clamp = "-p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu";
     return [
-      {
-        key:  `iptables -A FORWARD -i ${wgIface}`,
-        up:   `iptables -A FORWARD -i ${wgIface} -j ACCEPT`,
-        down: `iptables -D FORWARD -i ${wgIface} -j ACCEPT`,
-      },
-      {
-        key:  `iptables -A FORWARD -o ${wgIface}`,
-        up:   `iptables -A FORWARD -o ${wgIface} -j ACCEPT`,
-        down: `iptables -D FORWARD -o ${wgIface} -j ACCEPT`,
-      },
-      {
-        key:  `MASQUERADE`,
-        up:   `iptables -t nat -A POSTROUTING -o ${wanIf} -j MASQUERADE`,
-        down: `iptables -t nat -D POSTROUTING -o ${wanIf} -j MASQUERADE`,
-      },
-      {
-        key:  `TCPMSS`,
-        up:   `iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu`,
-        down: `iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu`,
-      },
-      {
-        key:  `ip6tables -A FORWARD -i ${wgIface}`,
-        up:   v6(`ip6tables -A FORWARD -i ${wgIface} -j ACCEPT`),
-        down: v6(`ip6tables -D FORWARD -i ${wgIface} -j ACCEPT`),
-      },
-      {
-        key:  `ip6tables -A FORWARD -o ${wgIface}`,
-        up:   v6(`ip6tables -A FORWARD -o ${wgIface} -j ACCEPT`),
-        down: v6(`ip6tables -D FORWARD -o ${wgIface} -j ACCEPT`),
-      },
-      {
-        key:  `ip6tables -t nat -A POSTROUTING`,
-        up:   v6(`ip6tables -t nat -A POSTROUTING -o ${wanIf} -j MASQUERADE`),
-        down: v6(`ip6tables -t nat -D POSTROUTING -o ${wanIf} -j MASQUERADE`),
-      },
-      {
-        key:  `ip6tables -t mangle`,
-        up:   v6(`ip6tables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu`),
-        down: v6(`ip6tables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu`),
-      },
+      { key: `iptables -A FORWARD -i ${wgIface}`,
+        ...iptRule("iptables", "filter", "FORWARD", `-i ${wgIface} -j ACCEPT`) },
+      { key: `iptables -A FORWARD -o ${wgIface}`,
+        ...iptRule("iptables", "filter", "FORWARD", `-o ${wgIface} -j ACCEPT`) },
+      { key: `MASQUERADE`,
+        ...iptRule("iptables", "nat", "POSTROUTING", `-o ${wanIf} -j MASQUERADE`) },
+      { key: `TCPMSS`,
+        ...iptRule("iptables", "mangle", "FORWARD", clamp) },
+      { key: `ip6tables -A FORWARD -i ${wgIface}`,
+        ...iptRule("ip6tables", "filter", "FORWARD", `-i ${wgIface} -j ACCEPT`, true) },
+      { key: `ip6tables -A FORWARD -o ${wgIface}`,
+        ...iptRule("ip6tables", "filter", "FORWARD", `-o ${wgIface} -j ACCEPT`, true) },
+      { key: `ip6tables -t nat -A POSTROUTING`,
+        ...iptRule("ip6tables", "nat", "POSTROUTING", `-o ${wanIf} -j MASQUERADE`, true) },
+      { key: `ip6tables -t mangle`,
+        ...iptRule("ip6tables", "mangle", "FORWARD", clamp, true) },
     ];
   }
 
@@ -187,27 +185,21 @@ async function ensureLiveNat(wanIf, wgIface, b) {
   const be = b || (await backend());
 
   if (be === "iptables") {
-    const addIfMissing = async (addCmd) => {
-      // `-A` → `-C` turns an append into an existence check.
-      const checkCmd = addCmd.replace(/ -A /, " -C ").replace(/ 2>\/dev\/null \|\| true$/, "");
-      if ((await tryRun(checkCmd)) === null) {
-        await tryRun(`${addCmd.replace(/ 2>\/dev\/null \|\| true$/, "")} 2>/dev/null`);
-        return 1;
-      }
-      return 0;
-    };
     let added = 0;
     for (const f of fragments("iptables", wanIf, wgIface)) {
-      added += await addIfMissing(f.up);
+      if ((await tryRun(f.check)) !== null) continue; // already present
+      // Count only rules that actually landed (ip6tables may be unavailable —
+      // that must not read as "rules were missing" on every health poll).
+      if ((await tryRun(`${f.add} 2>/dev/null`)) !== null) added++;
     }
     return added;
   }
 
   // nftables: check for table existence; build if absent.  Missing clamp on
   // an older table is patched incrementally.
-  const tableExists = (await tryRun("nft list table inet wpn")) !== null;
+  const tableExists = (await tryRunBin("nft", ["list", "table", "inet", "wpn"])) !== null;
   if (tableExists) {
-    const ruleset = (await tryRun("nft list table inet wpn")) || "";
+    const ruleset = (await tryRunBin("nft", ["list", "table", "inet", "wpn"])) || "";
     if (!ruleset.includes("maxseg")) {
       await tryRun(
         `nft add rule inet wpn forward ` +
@@ -286,10 +278,10 @@ async function patchConfNat(conf, wanIf, wgIface, b) {
  */
 async function openPorts(ufw, wgPort, agentPort, echoPort, stealthPort) {
   if (!ufw) return;
-  await tryRun(`ufw allow ${wgPort}/udp`);
-  await tryRun(`ufw allow ${agentPort}/tcp`);
-  if (echoPort)   await tryRun(`ufw allow ${echoPort}/udp`);
-  if (stealthPort) await tryRun(`ufw allow ${stealthPort}/tcp`);
+  await tryRunBin("ufw", ["allow", `${wgPort}/udp`]);
+  await tryRunBin("ufw", ["allow", `${agentPort}/tcp`]);
+  if (echoPort)   await tryRunBin("ufw", ["allow", `${echoPort}/udp`]);
+  if (stealthPort) await tryRunBin("ufw", ["allow", `${stealthPort}/tcp`]);
   log.ok(
     `ufw: opened udp/${wgPort} tcp/${agentPort}` +
       (echoPort ? ` udp/${echoPort}` : "") +
