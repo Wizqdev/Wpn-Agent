@@ -15,8 +15,9 @@
 
 const fs = require("fs");
 const os = require("os");
+const path = require("path");
 const crypto = require("crypto");
-const { run, runBin, tryRun, tryRunBin, log } = require("./util");
+const { run, runBin, tryRun, tryRunBin, log, err: httpErr } = require("./util");
 const { confLock } = require("./lock");
 const firewall = require("./firewall");
 
@@ -25,7 +26,8 @@ const firewall = require("./firewall");
 // ---------------------------------------------------------------------------
 
 const WG_IFACE    = process.env.WPN_WG_IFACE || "wg0";
-const WG_CONF     = `/etc/wireguard/${WG_IFACE}.conf`;
+/** `WPN_WG_CONF` is a test hook; production always uses /etc/wireguard. */
+const WG_CONF     = process.env.WPN_WG_CONF || `/etc/wireguard/${WG_IFACE}.conf`;
 const WG_KEY_FILE = "/etc/wireguard/server.key";
 const SUBNET_V4   = process.env.WPN_SUBNET_V4 || "10.66.0.1/24";
 const SUBNET_V6   = process.env.WPN_SUBNET_V6 || "fd00:66::1/64";
@@ -38,6 +40,35 @@ const INSTALLERS = {
   pacman:    "pacman -S --noconfirm --needed wireguard-tools iptables",
   zypper:    "zypper -n install wireguard-tools iptables",
 };
+
+/** `wg set` calls made while holding {@link confLock} must not hang the API. */
+const WG_SET_TIMEOUT_MS = 10_000;
+
+/**
+ * Atomically replace `file`: write a sibling temp file (fsync'd), rename it
+ * over the original, then fsync the directory.  A crash at any point leaves
+ * either the old or the new conf intact — never a truncated one.
+ *
+ * @param {string} file
+ * @param {string} data
+ * @param {number} [mode]
+ */
+function writeFileAtomic(file, data, mode = 0o600) {
+  const tmp = `${file}.tmp`;
+  const fd  = fs.openSync(tmp, "w", mode);
+  try {
+    fs.fchmodSync(fd, mode);
+    fs.writeFileSync(fd, data);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.renameSync(tmp, file);
+  try {
+    const dfd = fs.openSync(path.dirname(file), "r");
+    try { fs.fsyncSync(dfd); } finally { fs.closeSync(dfd); }
+  } catch {}
+}
 
 // ---------------------------------------------------------------------------
 // Address validation
@@ -230,7 +261,7 @@ async function ensureConfig(r, wgPort) {
   if (!fs.existsSync(WG_CONF)) {
     const priv = fs.readFileSync(WG_KEY_FILE, "utf8").trim();
     const { up, down } = await firewall.confNatRules(r.wanIf, WG_IFACE);
-    fs.writeFileSync(
+    writeFileAtomic(
       WG_CONF,
       [
         "[Interface]",
@@ -241,7 +272,7 @@ async function ensureConfig(r, wgPort) {
         `PostDown = ${down}`,
         "",
       ].join("\n"),
-      { mode: 0o600 }
+      0o600
     );
     log.ok(`${WG_IFACE}.conf written (nat on ${r.wanIf}, backend: ${await firewall.backend()})`);
   }
@@ -255,7 +286,7 @@ async function ensureForwarding() {
     "/etc/sysctl.d/99-wpn.conf",
     "net.ipv4.ip_forward=1\nnet.ipv6.conf.all.forwarding=1\n"
   );
-  await tryRun("sysctl --system -q");
+  await tryRunBin("sysctl", ["--system", "-q"]);
   log.ok("ip forwarding enabled");
 }
 
@@ -272,7 +303,7 @@ async function ensureUp(r) {
     }
     log.warn("systemd start failed — falling back to wg-quick");
   }
-  await run(`wg-quick up ${WG_CONF}`);
+  await runBin("wg-quick", ["up", WG_CONF]);
   log.ok(`${WG_IFACE} up via wg-quick`);
 }
 
@@ -295,7 +326,7 @@ async function ensureNat(r) {
       const before = fs.readFileSync(WG_CONF, "utf8");
       const after  = await firewall.patchConfNat(before, r.wanIf, WG_IFACE);
       if (after !== before) {
-        fs.writeFileSync(WG_CONF, after, { mode: 0o600 });
+        writeFileAtomic(WG_CONF, after);
         log.ok("nat rules persisted into wg0.conf");
       }
     } finally {
@@ -432,16 +463,17 @@ function validatePeerAddrs(addrs) {
   for (const a of addrs) {
     const isV6 = a.includes(":");
     if (isV6 ? !expandIPv6(a) : !isValidIPv4(a)) {
-      throw new Error(`address ${a} is not a valid IPv4 or IPv6 address`);
+      throw httpErr(400, `address ${a} is not a valid IPv4 or IPv6 address`);
     }
     if (!addrInSubnet(a, isV6 ? SUBNET_V6 : SUBNET_V4)) {
-      throw new Error(
+      throw httpErr(
+        400,
         `address ${a} is outside the node subnet ` +
           `(${isV6 ? SUBNET_V6 : SUBNET_V4})`
       );
     }
     if (normAddr(a) === (isV6 ? serverV6 : serverV4)) {
-      throw new Error(`address ${a} collides with the server's own tunnel address`);
+      throw httpErr(400, `address ${a} collides with the server's own tunnel address`);
     }
   }
 }
@@ -449,6 +481,9 @@ function validatePeerAddrs(addrs) {
 /**
  * Build the set of tunnel addresses already claimed by *other* peers,
  * looking at both the live interface and the persisted conf.
+ *
+ * The caller must hold {@link confLock} — the snapshot is only trustworthy
+ * as a conflict check when the whole check-and-apply sequence is serialised.
  *
  * @param {string} excludeKey - Pubkey whose own addresses don't count.
  * @returns {Promise<Map<string, string>>} addr → owning pubkey.
@@ -462,35 +497,90 @@ async function claimedAddrs(excludeKey) {
     for (const ip of p.allowedIps.split(",")) claim(p.publicKey, ip.trim().split("/")[0]);
   }
   if (fs.existsSync(WG_CONF)) {
-    const release = await confLock.acquire();
-    try {
-      for (const p of parseConfPeers(fs.readFileSync(WG_CONF, "utf8"))) {
-        for (const ip of p.allowedIps) claim(p.publicKey, ip);
-      }
-    } finally {
-      release();
+    for (const p of parseConfPeers(fs.readFileSync(WG_CONF, "utf8"))) {
+      for (const ip of p.allowedIps) claim(p.publicKey, ip);
     }
   }
   return claimed;
 }
 
 /**
+ * Undo a live change after a persist failure: restore the peer's previous
+ * allowed-ips when `prev` is given (re-add / failed removal), else remove the
+ * peer.  Never throws — returns the rollback error (or null) so the caller
+ * can report drift honestly.
+ *
+ * @param {string} publicKey
+ * @param {{ allowedIps: string }|undefined} prev - Live peer before the change.
+ * @returns {Promise<Error|null>}
+ */
+async function rollbackLive(publicKey, prev) {
+  try {
+    if (prev) {
+      await runBin("wg", [
+        "set", WG_IFACE, "peer", publicKey,
+        "allowed-ips", prev.allowedIps === "(none)" ? "" : prev.allowedIps,
+        "persistent-keepalive", "25",
+      ], { timeout: WG_SET_TIMEOUT_MS });
+    } else {
+      await runBin("wg", ["set", WG_IFACE, "peer", publicKey, "remove"], {
+        timeout: WG_SET_TIMEOUT_MS,
+      });
+    }
+    return null;
+  } catch (e) {
+    return e;
+  }
+}
+
+/**
+ * Roll back the live change and build the error for a failed conf write, so
+ * live state and `wg0.conf` never silently diverge.
+ *
+ * @param {"add"|"remove"} what
+ * @param {string} publicKey
+ * @param {{ allowedIps: string }|undefined} prev
+ * @param {Error} cause - The persist error.
+ * @returns {Promise<Error & {status: number}>}
+ */
+async function persistFailure(what, publicKey, prev, cause) {
+  const short = publicKey.slice(0, 8);
+  const rbErr = await rollbackLive(publicKey, prev);
+  if (rbErr) {
+    log.err(
+      `peer ${what} ${short}: persist failed (${cause.message}) AND rollback failed ` +
+        `(${rbErr.message}) — live state and ${WG_CONF} have DRIFTED`
+    );
+    return httpErr(
+      500,
+      `failed to persist peer ${what} and rollback failed — live/conf drift on ${short}…`
+    );
+  }
+  log.warn(`peer ${what} ${short}: persist failed (${cause.message}) — live change rolled back`);
+  return httpErr(500, `failed to persist peer ${what} (${cause.message}); change rolled back`);
+}
+
+/**
  * Add a peer to the live WireGuard interface and persist it to `wg0.conf`.
  * Validates addresses against the node subnet, detects IP conflicts across
  * both live and persisted state, and correctly replaces an existing block on
- * re-add.  All conf mutations are serialised through {@link confLock}.
+ * re-add.  The whole claim-check → apply → persist sequence is serialised
+ * through {@link confLock} so concurrent `POST /peers` calls cannot race the
+ * same address onto two peers.  If the conf write fails the live change is
+ * rolled back, so a retry by the control plane cannot double-add or diverge.
  *
  * @param {string} publicKey - Base64 WireGuard public key.
  * @param {string} address   - Tunnel address(es), e.g. `10.66.0.2` or `10.66.0.2,fd00:66::2`.
- * @returns {Promise<{ added: true, address: string }>}
- * @throws {Error} On validation failure, IP conflict, or wg command failure.
+ * @returns {Promise<{ added: true, address: string, persisted?: boolean }>}
+ * @throws {Error & {status: number}} 400 on validation failure, 409 on IP
+ *   conflict, 500 on wg command or persist failure.
  */
 async function addPeer(publicKey, address) {
   if (typeof publicKey !== "string" || !WG_KEY_RE.test(publicKey)) {
-    throw new Error("publicKey must be a base64 WireGuard key");
+    throw httpErr(400, "publicKey must be a base64 WireGuard key");
   }
   if (typeof address !== "string" || !address.trim()) {
-    throw new Error("address is required");
+    throw httpErr(400, "address is required");
   }
 
   const addrs = address.split(",").map((a) => a.trim()).filter(Boolean);
@@ -500,74 +590,93 @@ async function addPeer(publicKey, address) {
     .map((a) => (a.includes(":") ? `${a}/128` : `${a}/32`))
     .join(",");
 
-  // Exact-match conflict check across live + persisted state.
-  const claimed = await claimedAddrs(publicKey);
-  for (const a of addrs) {
-    const owner = claimed.get(normAddr(a));
-    if (owner) {
-      throw new Error(
-        `address ${a} is already assigned to peer ${owner.slice(0, 8)}…`
-      );
-    }
-  }
-
-  // Apply live
-  await runBin("wg", [
-    "set", WG_IFACE,
-    "peer", publicKey,
-    "allowed-ips", allowedIps,
-    "persistent-keepalive", "25",
-  ]);
-
-  // Persist under the conf lock (skip gracefully if the conf is absent —
-  // e.g. --skip-wg dev mode — the peer still lives on the interface).
-  if (!fs.existsSync(WG_CONF)) {
-    log.warn(`${WG_CONF} missing — peer added live but not persisted`);
-    return { added: true, address, persisted: false };
-  }
   const release = await confLock.acquire();
   try {
-    const conf = fs.readFileSync(WG_CONF, "utf8");
-    fs.writeFileSync(
-      WG_CONF,
-      upsertPeerConf(conf, { publicKey, address, allowedIps }),
-      { mode: 0o600 }
-    );
+    // Exact-match conflict check across live + persisted state.  Done under
+    // the lock: a concurrent addPeer that commits the same address before we
+    // `wg set` would otherwise be invisible to this check.
+    const claimed = await claimedAddrs(publicKey);
+    for (const a of addrs) {
+      const owner = claimed.get(normAddr(a));
+      if (owner) {
+        throw httpErr(
+          409,
+          `address ${a} is already assigned to peer ${owner.slice(0, 8)}…`
+        );
+      }
+    }
+
+    // Snapshot for rollback (a re-add of an existing key restores its old IPs).
+    const prev = (await dump()).peers.find((p) => p.publicKey === publicKey);
+
+    // Apply live
+    await runBin("wg", [
+      "set", WG_IFACE,
+      "peer", publicKey,
+      "allowed-ips", allowedIps,
+      "persistent-keepalive", "25",
+    ], { timeout: WG_SET_TIMEOUT_MS });
+
+    // Persist.  Skipped when the conf is absent (e.g. --skip-wg dev mode —
+    // the peer still lives on the interface).  A failed write rolls the live
+    // change back and errors out; it never reports success for a peer that
+    // would vanish on reboot.
+    if (!fs.existsSync(WG_CONF)) {
+      log.warn(`${WG_CONF} missing — peer added live but not persisted`);
+      return { added: true, address, persisted: false };
+    }
+    try {
+      const conf = fs.readFileSync(WG_CONF, "utf8");
+      writeFileAtomic(WG_CONF, upsertPeerConf(conf, { publicKey, address, allowedIps }));
+    } catch (e) {
+      throw await persistFailure("add", publicKey, prev, e);
+    }
+
+    return { added: true, address };
   } finally {
     release();
   }
-
-  return { added: true, address };
 }
 
 /**
  * Remove a peer from the live WireGuard interface and from `wg0.conf`.
- * The conf rewrite is serialised through {@link confLock}.
+ * The live removal and the conf rewrite happen under {@link confLock}, so
+ * they serialise against concurrent adds of the same key; if the conf write
+ * fails the live peer is restored.
  *
  * @param {string} publicKey - Base64 WireGuard public key.
- * @returns {Promise<{ removed: true }>}
+ * @returns {Promise<{ removed: true, persisted?: boolean }>}
+ * @throws {Error & {status: number}} 400 on a bad key, 500 on persist failure.
  */
 async function removePeer(publicKey) {
   if (typeof publicKey !== "string" || !WG_KEY_RE.test(publicKey)) {
-    throw new Error("invalid peer key");
+    throw httpErr(400, "invalid peer key");
   }
 
-  // Remove from live interface first (safe outside the lock — wg set is atomic).
-  await tryRunBin("wg", ["set", WG_IFACE, "peer", publicKey, "remove"]);
-
-  if (!fs.existsSync(WG_CONF)) {
-    return { removed: true, persisted: false };
-  }
   const release = await confLock.acquire();
   try {
-    const before = fs.readFileSync(WG_CONF, "utf8");
-    const after  = removePeerFromConf(before, publicKey);
-    if (after !== before) fs.writeFileSync(WG_CONF, after, { mode: 0o600 });
+    const prev = (await dump()).peers.find((p) => p.publicKey === publicKey);
+    await tryRunBin("wg", ["set", WG_IFACE, "peer", publicKey, "remove"], {
+      timeout: WG_SET_TIMEOUT_MS,
+    });
+
+    if (!fs.existsSync(WG_CONF)) {
+      return { removed: true, persisted: false };
+    }
+    try {
+      const before = fs.readFileSync(WG_CONF, "utf8");
+      const after  = removePeerFromConf(before, publicKey);
+      if (after !== before) writeFileAtomic(WG_CONF, after);
+    } catch (e) {
+      // Only restore if there was a live peer to bring back.
+      throw prev
+        ? await persistFailure("remove", publicKey, prev, e)
+        : httpErr(500, `failed to persist peer removal (${e.message})`);
+    }
+    return { removed: true };
   } finally {
     release();
   }
-
-  return { removed: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -599,9 +708,9 @@ function parseDump(out, iface) {
       publicKey:       f[base],
       endpoint:        f[base + 2] === "(none)" ? null : f[base + 2],
       allowedIps:      f[base + 3] || "",
-      latestHandshake: parseInt(f[base + 4], 10) || 0,
-      rx:              parseInt(f[base + 5], 10) || 0,
-      tx:              parseInt(f[base + 6], 10) || 0,
+      latestHandshake: Math.max(0, parseInt(f[base + 4], 10) || 0),
+      rx:              Math.max(0, parseInt(f[base + 5], 10) || 0),
+      tx:              Math.max(0, parseInt(f[base + 6], 10) || 0),
     });
   }
   return peers;

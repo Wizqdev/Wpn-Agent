@@ -40,6 +40,10 @@ const execFileAsync = promisify(execFile);
  * @throws {Error} If the command exits non-zero.  `err.stderr` is attached.
  */
 async function run(cmd, opts = {}) {
+  if (_fake) {
+    if (!_fake.run) throw new Error(`fake runner has no run(): ${cmd}`);
+    return String(await _fake.run(cmd, opts)).trim();
+  }
   const { stdout } = await execAsync(cmd, {
     timeout: 120_000,
     maxBuffer: 16 * 1_024 * 1_024,
@@ -59,6 +63,10 @@ async function run(cmd, opts = {}) {
  * @throws {Error} If the command exits non-zero.  `err.stderr` is attached.
  */
 async function runBin(bin, args, opts = {}) {
+  if (_fake) {
+    if (!_fake.runBin) throw new Error(`fake runner has no runBin(): ${bin} ${args.join(" ")}`);
+    return String(await _fake.runBin(bin, args, opts)).trim();
+  }
   const { stdout } = await execFileAsync(bin, args, {
     timeout: 120_000,
     maxBuffer: 16 * 1_024 * 1_024,
@@ -81,9 +89,70 @@ const tryRun = (cmd) => run(cmd).catch(() => null);
  *
  * @param {string}   bin
  * @param {string[]} args
+ * @param {import("child_process").ExecFileOptions} [opts]
  * @returns {Promise<string|null>}
  */
-const tryRunBin = (bin, args) => runBin(bin, args).catch(() => null);
+const tryRunBin = (bin, args, opts) => runBin(bin, args, opts).catch(() => null);
+
+// ---------------------------------------------------------------------------
+// HTTP error helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Build an `Error` carrying an HTTP status code for the control API.
+ *
+ * @param {number} status
+ * @param {string} message
+ * @returns {Error & {status: number}}
+ */
+const err = (status, message) => Object.assign(new Error(message), { status });
+
+/**
+ * Fixed-window rate limiter.  Returns a predicate that yields `true` once a
+ * key exceeds `limit` hits inside `windowMs`.  Expired entries are swept
+ * lazily when the map grows past `sweepAt` keys.
+ *
+ * @param {{ limit: number, windowMs?: number, sweepAt?: number }} opts
+ * @returns {(key: string) => boolean}
+ */
+const rateLimiter = ({ limit, windowMs = 60_000, sweepAt = 4_096 }) => {
+  const hits = new Map();
+  return (key) => {
+    const now = Date.now();
+    const e   = hits.get(key);
+    if (!e || now > e.reset) {
+      hits.set(key, { count: 1, reset: now + windowMs });
+      if (hits.size > sweepAt) {
+        for (const [k, v] of hits) if (now > v.reset) hits.delete(k);
+      }
+      return false;
+    }
+    return ++e.count > limit;
+  };
+};
+
+// ---------------------------------------------------------------------------
+// Test seam
+// ---------------------------------------------------------------------------
+
+/**
+ * @typedef {object} FakeRunner
+ * @property {(cmd: string, opts: object) => Promise<string>|string} [run]
+ * @property {(bin: string, args: string[], opts: object) => Promise<string>|string} [runBin]
+ */
+
+/** @type {FakeRunner|null} */
+let _fake = null;
+
+/**
+ * Route every {@link run} / {@link runBin} call to `fake` (tests only), so
+ * system-touching logic can be exercised without root or real binaries.
+ * @param {FakeRunner} fake
+ */
+const setRunner = (fake) => { _fake = fake; };
+
+/** Restore real process execution. */
+const resetRunner = () => { _fake = null; };
 
 // ---------------------------------------------------------------------------
 // Environment
@@ -153,4 +222,4 @@ const log = {
   err:   (m, meta) => _emit("error", m, meta),
 };
 
-module.exports = { run, runBin, tryRun, tryRunBin, isRoot, log };
+module.exports = { run, runBin, tryRun, tryRunBin, err, rateLimiter, isRoot, log, setRunner, resetRunner };
