@@ -16,7 +16,7 @@ const http   = require("http");
 const https  = require("https");
 const crypto = require("crypto");
 const identity = require("./identity");
-const { log } = require("./util");
+const { err, log, rateLimiter } = require("./util");
 
 // ---------------------------------------------------------------------------
 // Rate limiting
@@ -25,36 +25,15 @@ const { log } = require("./util");
 const RATE_LIMIT    = 120;      // authed requests / minute / IP
 const RATE_SWEEP_AT = 4_096;    // sweep map when it exceeds this many entries
 
-/** @type {Map<string, {count: number, reset: number}>} */
-const hits = new Map();
-
-/**
- * @param {string} ip
- * @returns {boolean} `true` if this IP has exceeded the rate limit.
- */
-function rateLimited(ip) {
-  const now = Date.now();
-  const e   = hits.get(ip);
-  if (!e || now > e.reset) {
-    hits.set(ip, { count: 1, reset: now + 60_000 });
-    if (hits.size > RATE_SWEEP_AT) {
-      for (const [k, v] of hits) if (now > v.reset) hits.delete(k);
-    }
-    return false;
-  }
-  return ++e.count > RATE_LIMIT;
-}
+/** `true` when the IP has exceeded the authenticated rate limit. */
+const rateLimited = rateLimiter({ limit: RATE_LIMIT, sweepAt: RATE_SWEEP_AT });
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/**
- * @param {number} status
- * @param {string} message
- * @returns {Error & {status: number}}
- */
-const err = (status, message) => Object.assign(new Error(message), { status });
+/** Maximum request-body size, in bytes. */
+const MAX_BODY_BYTES = 64 * 1_024;
 
 /** Methods that may carry a JSON body. */
 const BODY_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
@@ -68,7 +47,8 @@ const BODY_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
  */
 const readBody = (req) =>
   new Promise((resolve, reject) => {
-    let data = "";
+    const chunks = [];
+    let bytes = 0;
     let done = false;
     const fail = (e) => {
       if (done) return;
@@ -77,13 +57,17 @@ const readBody = (req) =>
       reject(e);
     };
     req.on("data", (c) => {
-      data += c;
-      if (data.length > 64 * 1_024) fail(err(413, "body too large"));
+      if (done) return;
+      const buf = Buffer.isBuffer(c) ? c : Buffer.from(c);
+      bytes += buf.length; // true bytes, not UTF-16 units
+      if (bytes > MAX_BODY_BYTES) return fail(err(413, "body too large"));
+      chunks.push(buf); // decode once at the end — a multi-byte char may span chunks
     });
     req.on("end", () => {
       if (done) return;
       done = true;
       try {
+        const data = Buffer.concat(chunks).toString("utf8");
         resolve(data ? JSON.parse(data) : {});
       } catch {
         reject(err(400, "bad JSON"));
@@ -253,6 +237,7 @@ function serve({ port, token, tls, routes, health }) {
         return r.slice(0, i) === req.method && match(r.slice(i + 1), path);
       });
       if (!isPublic && !authed(req, token)) {
+        log.warn(`auth failure from ${ip} on ${req.method} ${path}`);
         return send(401, { ok: false, error: "unauthorized" });
       }
 
@@ -300,4 +285,4 @@ function serve({ port, token, tls, routes, health }) {
   };
 }
 
-module.exports = { serve, match, rateLimited, authed };
+module.exports = { serve, match, rateLimited, authed, readBody, MAX_BODY_BYTES };

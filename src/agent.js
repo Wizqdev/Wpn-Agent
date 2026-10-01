@@ -17,7 +17,7 @@ const crypto         = require("crypto");
 const fs             = require("fs");
 const os             = require("os");
 const path           = require("path");
-const { isRoot, log, runBin } = require("./util");
+const { isRoot, log, runBin, err, rateLimiter } = require("./util");
 const preflight      = require("./preflight");
 const wg             = require("./wireguard");
 const identity       = require("./identity");
@@ -65,21 +65,8 @@ const SPEED_DEF   = 2 * 1_024 * 1_024;
 const SPEED_MAX   = 8 * 1_024 * 1_024;
 const SPEED_CHUNK = 65_536;
 
-const speedHits = new Map();
-
-function speedLimited(ip) {
-  const now = Date.now();
-  const e   = speedHits.get(ip);
-  if (!e || now > e.reset) {
-    speedHits.set(ip, { count: 1, reset: now + 60_000 });
-  } else if (++e.count > SPEED_LIMIT) {
-    return true;
-  }
-  if (speedHits.size > 4_096) {
-    for (const [k, v] of speedHits) if (now > v.reset) speedHits.delete(k);
-  }
-  return false;
-}
+/** `true` when the IP has exceeded the speedtest rate limit. */
+const speedLimited = rateLimiter({ limit: SPEED_LIMIT });
 
 /**
  * Payload source for /speedtest.  Filled once with random bytes and reused —
@@ -139,8 +126,6 @@ async function banner(token, scheme, cachedIp, opts = {}) {
 // ---------------------------------------------------------------------------
 
 function routes() {
-  const err = (status, message) => Object.assign(new Error(message), { status });
-
   return {
     VERSION,
     dir:          DIR,
@@ -243,28 +228,50 @@ function routes() {
       wgVersion:    await wg.version(),
     }),
 
-    "POST /update": async () => {
+    "POST /update": async (_b, _p, { ip }) => {
+      // Root code execution from a bearer token is a large blast radius, so
+      // remote update is opt-in per node.
+      if (process.env.WPN_ALLOW_REMOTE_UPDATE !== "1") {
+        log.warn(`remote update refused for ${ip} (WPN_ALLOW_REMOTE_UPDATE is not 1)`);
+        throw err(403, "remote update is disabled on this node — set WPN_ALLOW_REMOTE_UPDATE=1 to enable it");
+      }
       // The code lives in APP_DIR (e.g. /opt/wpn-agent); DIR only holds
       // identity material.  install.sh deploys `.git` along with the code so
-      // fast-forward pulls work here.
+      // fast-forward updates work here.
       if (!fs.existsSync(path.join(APP_DIR, ".git"))) {
         throw err(409, "agent is not a git checkout — update manually");
       }
+      const git  = (...args) => runBin("git", ["-C", APP_DIR, ...args], { timeout: 60_000 });
+      const head = () => git("rev-parse", "HEAD").catch(() => null);
+      const before = await head();
+
       let output = "";
       try {
-        output = await runBin("git", ["-C", APP_DIR, "pull", "--ff-only"], {
-          timeout: 60_000,
-        });
+        // fetch → (optionally verify) → fast-forward: the signature is checked
+        // BEFORE the working tree moves, so a bad commit is never applied.
+        await git("fetch");
+        if (process.env.WPN_UPDATE_REQUIRE_SIGNED === "1") {
+          try {
+            await git("verify-commit", "FETCH_HEAD");
+          } catch {
+            log.warn(`update from ${ip} rejected: FETCH_HEAD is not a verified signed commit`, { before });
+            throw err(403, "update rejected: upstream commit has no valid signature");
+          }
+        }
+        output = await git("merge", "--ff-only", "FETCH_HEAD");
       } catch (e) {
-        throw err(502, `git pull failed: ${String(e.message).slice(0, 300)}`);
+        if (e.status) throw e;
+        throw err(502, `git update failed: ${String(e.message).slice(0, 300)}`);
       }
+      const after = await head();
+
       if (process.platform === "linux") {
         setTimeout(() => {
           runBin("systemctl", ["restart", "wpn-agent"]).catch(() => {});
         }, 1_000).unref();
       }
-      log.info("agent updated via /update", { from: VERSION });
-      return { ok: true, from: VERSION, output };
+      log.info(`agent updated via /update by ${ip}`, { from: VERSION, before, after });
+      return { ok: true, from: VERSION, output, before, after };
     },
   };
 }
@@ -292,7 +299,9 @@ async function main() {
   try {
     const { pub } = await wg.ensureServerKey();
     if (pub) fs.writeFileSync(identity.pubFile(DIR), pub + "\n", { mode: 0o644 });
-  } catch {}
+  } catch (e) {
+    log.warn(`server pubkey cache skipped: ${e.message}`);
+  }
 
   const token = identity.token(DIR);
 
@@ -339,4 +348,4 @@ async function main() {
   process.on("SIGINT",  () => shutdown("SIGINT"));
 }
 
-module.exports = { main };
+module.exports = { main, _routes: routes };
