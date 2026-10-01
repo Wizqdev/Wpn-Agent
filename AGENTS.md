@@ -14,8 +14,8 @@ stdlib), Node 18+ required, must run as root on Linux.
 
 ## Conventions
 
-- CommonJS `"use strict"`, JSDoc on every public function, heavy
-  section-banner comments (`// ---`).
+- CommonJS `"use strict"`. Source files intentionally carry **no comments**
+  — keep them comment-free (no `//`, `/* */`, or JSDoc blocks).
 - All system calls are **async** via `util.runBin` (arg arrays, no shell —
   preferred) or `util.run` (shell string, only when pipes/redirects needed).
   Never `execSync`/`execFileSync` — they block the event loop.

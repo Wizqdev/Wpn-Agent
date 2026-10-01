@@ -7,6 +7,15 @@
 
 **Zero npm dependencies — pure Node.js stdlib.  Requires Node.js 18+.**
 
+## Requirements
+
+| Requirement | Detail |
+|---|---|
+| OS | Linux with systemd (Debian/Ubuntu, Fedora/RHEL, Arch, openSUSE) |
+| Privileges | root (the agent manages `wg0`, firewall rules and `sysctl`) |
+| Runtime | Node.js 18+ (installed automatically by `install.sh` if missing) |
+| Network | Public IPv4; open `udp/51820` and `tcp/44664` in your cloud firewall |
+
 ---
 
 ## Quick start (one-liner)
@@ -183,22 +192,26 @@ On systemd installs, put overrides in `/etc/wpn-agent/agent.env`
 
 ## Service management
 
-```bash
-# Logs
-journalctl -u wpn-agent -f
+| Task | Command |
+|---|---|
+| Follow logs | `journalctl -u wpn-agent -f` |
+| Status | `systemctl status wpn-agent` |
+| Restart | `systemctl restart wpn-agent` |
+| Re-print URL + key | `node /opt/wpn-agent/bin/wpn-agent --print` |
+| Upgrade (re-runs installer) | `curl -fsSL https://raw.githubusercontent.com/Wizqdev/Wpn-Agent/main/install.sh \| sudo bash` |
 
-# Status
-systemctl status wpn-agent
+---
 
-# Restart
-systemctl restart wpn-agent
+## Development
 
-# Re-print URL + key after service is running
-node /opt/wpn-agent/bin/wpn-agent --print
+| Task | Command |
+|---|---|
+| Run the test suite | `npm test` |
+| Run the API only, without WireGuard (unprivileged) | `WPN_AGENT_DIR=/tmp/wpn-agent npm run dev` |
+| Regenerate `systemd/wpn-agent.service` after editing the unit template | `npm run gen:unit` |
 
-# Upgrade (pulls latest from git + restarts)
-curl -fsSL https://raw.githubusercontent.com/Wizqdev/Wpn-Agent/main/install.sh | sudo bash
-```
+Tests use Node's built-in runner and a fake command runner, so they need
+neither root nor a Linux host.
 
 ---
 

@@ -1,8 +1,5 @@
 "use strict";
 
-// Peer-management tests against a fake `wg` and a temp wg0.conf.  The conf
-// path must be set BEFORE the module is loaded (it is read at require time).
-
 const test   = require("node:test");
 const assert = require("node:assert");
 const fs     = require("fs");
@@ -20,7 +17,6 @@ const { confLock } = require("../src/lock");
 const INITIAL = "[Interface]\nAddress = 10.66.0.1/24\nPrivateKey = X\n\n";
 const tick    = () => new Promise((r) => setImmediate(r));
 
-/** Fake kernel peer table: pubkey -> allowed-ips string. */
 const live = new Map();
 let wgSetCalls = 0;
 
@@ -35,7 +31,7 @@ util.setRunner({
     }
     if (args[0] === "set") {
       wgSetCalls++;
-      await tick(); // widen the race window — without the lock this interleaves
+      await tick();
       await tick();
       const key = args[3];
       if (args[4] === "remove") live.delete(key);
@@ -54,7 +50,7 @@ test.after(() => {
 
 const key = () => wg._genKeyPair().pub;
 
-/** conf + live state as comparable key -> sorted bare-IP list. */
+
 function snapshots() {
   const norm = (list) => list.map((s) => s.split("/")[0]).sort().join(",");
   const confMap = new Map(
@@ -112,7 +108,7 @@ test("peers - validation errors are 400s", async () => {
 test("peers - persist failure on add rolls back the live peer", async () => {
   const k = key();
   const before = fs.readFileSync(CONF, "utf8");
-  fs.mkdirSync(`${CONF}.tmp`); // makes the atomic write fail (EISDIR) even as root
+  fs.mkdirSync(`${CONF}.tmp`);
   try {
     await assert.rejects(wg.addPeer(k, "10.66.0.200"), (e) => e.status === 500 && /rolled back/.test(e.message));
   } finally {
@@ -121,7 +117,7 @@ test("peers - persist failure on add rolls back the live peer", async () => {
   assert.ok(!live.has(k), "peer must not stay live after a failed persist");
   assert.strictEqual(fs.readFileSync(CONF, "utf8"), before, "conf untouched");
   assertConsistentAndUnique();
-  // A retry now succeeds cleanly — no phantom IP claim left behind.
+
   await wg.addPeer(k, "10.66.0.200");
   assertConsistentAndUnique();
 });

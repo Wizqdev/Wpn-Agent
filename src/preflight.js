@@ -1,12 +1,3 @@
-/**
- * @fileoverview Preflight — inspect the host machine before doing any work and
- * print a human-readable summary.  The operator can read this output and
- * sanity-check the box before changes are applied.
- *
- * `publicIp()` is memoised with a TTL: callers share one resolution, but the
- * value refreshes periodically so a failover/re-IP is eventually reflected in
- * `/info` instead of being stale for the lifetime of the process.
- */
 
 "use strict";
 
@@ -15,15 +6,6 @@ const fs = require("fs");
 const https = require("https");
 const { tryRun, tryRunBin } = require("./util");
 
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Parse `/etc/os-release` for a human-friendly distro description.
- *
- * @returns {{ id: string, pretty: string }}
- */
 const osRelease = () => {
   try {
     const raw = fs.readFileSync("/etc/os-release", "utf8");
@@ -35,11 +17,6 @@ const osRelease = () => {
   }
 };
 
-/**
- * Detect the first available package manager from a priority-ordered list.
- *
- * @returns {Promise<string|null>}
- */
 const detectPkgMgr = async () => {
   for (const m of ["apt-get", "dnf", "yum", "pacman", "zypper"]) {
     if (await tryRun(`command -v ${m}`)) return m;
@@ -47,59 +24,33 @@ const detectPkgMgr = async () => {
   return null;
 };
 
-// ---------------------------------------------------------------------------
-// Public IP — memoised with TTL so collect() and banner() share one lookup.
-// ---------------------------------------------------------------------------
-
-/** How long a resolved public IP stays cached (ms). */
 const PUBLIC_IP_TTL_MS = 10 * 60_000;
 
-/** @type {{ t: number, p: Promise<string|null> }|undefined} */
 let _publicIpCache;
 
-/**
- * Check if an IPv4 address is in any non-globally-routable space:
- * RFC1918, RFC6598 CGNAT, loopback, link-local, "this host", benchmark,
- * multicast/reserved.  Anything listed here cannot be the node's real
- * public endpoint.
- * @param {string} ip
- * @returns {boolean}
- */
 const isPrivateIp = (ip) => {
   const parts = ip.split(".").map(Number);
   if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) {
     return false;
   }
   const [a, b] = parts;
-  if (a === 0) return true;                            // 0.0.0.0/8   "this" network
-  if (a === 10) return true;                           // 10/8        RFC1918
-  if (a === 100 && b >= 64 && b <= 127) return true;   // 100.64/10   CGNAT
-  if (a === 127) return true;                          // 127/8       loopback
-  if (a === 169 && b === 254) return true;             // 169.254/16  link-local
-  if (a === 172 && b >= 16 && b <= 31) return true;    // 172.16/12   RFC1918
-  if (a === 192 && b === 0) return true;               // 192.0.0/24  IETF assignments
-  if (a === 192 && b === 168) return true;             // 192.168/16  RFC1918
-  if (a === 198 && (b === 18 || b === 19)) return true;// 198.18/15   benchmarking
-  if (a >= 224) return true;                           // 224/4 multicast + 240/4 reserved
+  if (a === 0) return true;
+  if (a === 10) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  if (a === 127) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 0) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 198 && (b === 18 || b === 19)) return true;
+  if (a >= 224) return true;
   return false;
 };
 
-/**
- * Bare-bones IPv4 shape+range check for the external-IP probe response.
- * @param {string} ip
- * @returns {boolean}
- */
 const looksLikeIPv4 = (ip) =>
   /^\d{1,3}(\.\d{1,3}){3}$/.test(ip) &&
   ip.split(".").every((o) => parseInt(o, 10) <= 255);
 
-/**
- * Fetch public IP using native Node.js https.  Hits the dedicated `/ip`
- * endpoint (the bare root returns an HTML page for non-curl user agents) and
- * strictly validates that the answer is actually a public IPv4 address —
- * a captive portal or HTML response must never end up in the banner.
- * @returns {Promise<string|null>}
- */
 const fetchExternalIp = () =>
   new Promise((resolve) => {
     const req = https.get(
@@ -110,7 +61,7 @@ const fetchExternalIp = () =>
         let data = "";
         res.on("data", (chunk) => {
           data += chunk;
-          if (data.length > 64) req.destroy(); // an IP is ≤15 chars — bail on junk
+          if (data.length > 64) req.destroy();
         });
         res.on("end", () => {
           const ip = data.trim();
@@ -125,14 +76,6 @@ const fetchExternalIp = () =>
     });
   });
 
-/**
- * Determine the host's public IPv4 address.
- * 1. Inspects the active default route interface. If its IP is public, use it.
- * 2. If it's a private IP (NATed, like EC2/GCP), queries via HTTPS natively.
- * Memoised with a {@link PUBLIC_IP_TTL_MS} TTL.
- *
- * @returns {Promise<string|null>}
- */
 const publicIp = async () => {
   const now = Date.now();
   if (_publicIpCache && now - _publicIpCache.t < PUBLIC_IP_TTL_MS) {
@@ -148,37 +91,20 @@ const publicIp = async () => {
       const extIp = await fetchExternalIp();
       if (extIp) return extIp;
 
-      return looksLikeIPv4(localIp || "") ? localIp : null; // last resort: any valid local addr
+      return looksLikeIPv4(localIp || "") ? localIp : null;
     })(),
   };
 
   return _publicIpCache.p;
 };
 
-/**
- * Check whether a port appears free using `ss`.
- *
- * @param {number} port
- * @param {"tcp"|"udp"} proto
- * @returns {Promise<boolean>} `true` if the port is free (or `ss` is unavailable).
- */
+
 const portFree = async (port, proto) => {
   const flag = proto === "udp" ? "-lun" : "-ltn";
   const out = await tryRun(`ss ${flag} 2>/dev/null | grep -c ':${port} '`);
-  return out === "0" || out === null; // null → ss missing; assume free
+  return out === "0" || out === null;
 };
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-/**
- * Collect a full machine snapshot used by the WireGuard bootstrap and the
- * preflight report.
- *
- * @param {{ agentPort: number, wgPort: number }} opts
- * @returns {Promise<object>} Machine report object.
- */
 async function collect({ agentPort, wgPort }) {
   const osr   = osRelease();
   const wgVer = ((await tryRunBin("wg", ["--version"])) || "").split(/\s+/)[1] || null;
@@ -220,24 +146,11 @@ async function collect({ agentPort, wgPort }) {
   };
 }
 
-// ---------------------------------------------------------------------------
-// Console report
-// ---------------------------------------------------------------------------
-
-/**
- * @param {string} k - Left-column label.
- * @param {string|boolean} v - Value; booleans are rendered as yes/no.
- */
 const row = (k, v) =>
   process.stdout.write(
     `   ${k.padEnd(18)} ${typeof v === "boolean" ? (v ? "yes" : "no") : v}\n`
   );
 
-/**
- * Print the preflight report to stdout.
- *
- * @param {Awaited<ReturnType<typeof collect>>} r
- */
 function report(r) {
   process.stdout.write("\n──────────────── machine ────────────────\n");
   row("os",           `${r.os.pretty} (${r.os.id})`);

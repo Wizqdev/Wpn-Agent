@@ -5,12 +5,9 @@ const assert = require("node:assert");
 const net = require("net");
 const { pickPort, canBind } = require("../src/stealth");
 
-// pickPort is exercised with high ports — 443/8443 need root on POSIX.
-
 test("stealth - pickPort falls back when the first port is occupied", async () => {
   const blocker = net.createServer();
-  // Bind the wildcard addr — matching what canBind probes (SO_REUSEADDR on
-  // BSD allows wildcard-after-specific coexistence, which would mask the bug).
+
   await new Promise((r) => blocker.listen(28443, "0.0.0.0", r));
   try {
     const picked = await pickPort([28443, 28444]);
@@ -30,11 +27,6 @@ test("stealth - canBind reports a busy port as false", async () => {
     blocker.close();
   }
 });
-
-// ---------------------------------------------------------------------------
-// ensure() — restart safety.  Fake systemctl + injected platform/paths; the
-// "wstunnel already running" case holds a real listening socket.
-// ---------------------------------------------------------------------------
 
 const fs   = require("fs");
 const os   = require("os");
@@ -94,8 +86,8 @@ test("stealth - first start picks the preferred port and writes a hardened, root
 test("stealth - restart while the relay holds the port keeps the advertised port", async () => {
   const h = harness();
   try {
-    await stealth.ensure(h.dir, { wgPort: 51820 }, h.deps);   // relay now "running" on P1
-    const relay = await listen(P1);                            // wstunnel holds the port
+    await stealth.ensure(h.dir, { wgPort: 51820 }, h.deps);
+    const relay = await listen(P1);
     try {
       h.state.calls.length = 0;
       const r = await stealth.ensure(h.dir, { wgPort: 51820 }, h.deps);
@@ -113,7 +105,7 @@ test("stealth - a changed unit restarts the running relay", async () => {
     const relay = await listen(P1);
     try {
       h.state.calls.length = 0;
-      const r = await stealth.ensure(h.dir, { wgPort: 51999 }, h.deps); // wg port changed
+      const r = await stealth.ensure(h.dir, { wgPort: 51999 }, h.deps);
       assert.strictEqual(r.port, P1);
       assert.ok(h.state.calls.includes("restart wpn-stealth"), "explicit restart required");
       assert.match(fs.readFileSync(h.deps.unit, "utf8"), /--restrict-to 127\.0\.0\.1:51999/);

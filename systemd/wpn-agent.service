@@ -1,4 +1,3 @@
-# Reference unit — `wpn-agent --install` writes this itself.
 [Unit]
 Description=Wpn WireGuard node agent
 After=network-online.target

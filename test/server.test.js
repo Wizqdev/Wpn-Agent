@@ -24,7 +24,7 @@ test("server - match returns null on malformed percent-encoding", () => {
 test("server - rate limiter limits after threshold", () => {
   const ip = "10.99.0.1";
   let limited = false;
-  // Threshold is 120
+
   for (let i = 0; i < 125; i++) {
     limited = rateLimited(ip);
   }
@@ -36,19 +36,14 @@ test("server - authed is constant-time and rejects wrong/missing tokens", () => 
   const req = (auth) => ({ headers: { authorization: auth } });
   assert.strictEqual(authed(req(`Bearer ${token}`), token), true);
   assert.strictEqual(authed(req("Bearer wrong"), token), false);
-  assert.strictEqual(authed(req(`${token}`), token), false);        // no scheme
-  assert.strictEqual(authed(req(""), token), false);                // missing
+  assert.strictEqual(authed(req(`${token}`), token), false);
+  assert.strictEqual(authed(req(""), token), false);
   assert.strictEqual(authed(req("Bearer " + token + "extra"), token), false);
 });
-
-// ---------------------------------------------------------------------------
-// readBody — byte-accurate size limit
-// ---------------------------------------------------------------------------
 
 const { EventEmitter } = require("node:events");
 const { readBody, MAX_BODY_BYTES } = require("../src/server");
 
-/** Fake IncomingMessage that streams `buf` in `parts` chunks (splits may land mid-codepoint). */
 function fakeReq(buf, parts = 3) {
   const req = new EventEmitter();
   req.destroyed = false;
@@ -62,7 +57,7 @@ function fakeReq(buf, parts = 3) {
 }
 
 const jsonOfBytes = (bytes) => {
-  // {"a":"<n × é>"} = 8 ASCII bytes + 2 bytes per é
+
   const n = (bytes - 8) / 2;
   return Buffer.from(`{"a":"${"é".repeat(n)}"}`);
 };
@@ -70,14 +65,14 @@ const jsonOfBytes = (bytes) => {
 test("server - readBody limit counts bytes, not UTF-16 units (multi-byte at the limit)", async () => {
   const atLimit = jsonOfBytes(MAX_BODY_BYTES);
   assert.strictEqual(atLimit.length, MAX_BODY_BYTES);
-  const body = await readBody(fakeReq(atLimit)); // split mid-"é" across chunks
+  const body = await readBody(fakeReq(atLimit));
   assert.strictEqual(body.a.length, (MAX_BODY_BYTES - 8) / 2);
   assert.ok(!body.a.includes("\uFFFD"), "chunk boundaries must not corrupt multi-byte chars");
 });
 
 test("server - readBody rejects 413 one multi-byte char over the limit", async () => {
   const over = jsonOfBytes(MAX_BODY_BYTES + 2);
-  // Under the old UTF-16 length check this body (~32 K code units) would have been accepted.
+
   await assert.rejects(readBody(fakeReq(over)), (e) => e.status === 413);
 });
 
