@@ -498,6 +498,45 @@ async function dump() {
   return { peers: out ? parseDump(out, WG_IFACE) : [] };
 }
 
+async function knownPeers() {
+  const byKey = new Map();
+  for (const p of (await dump()).peers) {
+    byKey.set(p.publicKey, { ...p, confOnly: false });
+  }
+  const mergeIps = (entry, ips) => {
+    const set = new Set(
+      String(entry.allowedIps || "")
+        .split(",")
+        .map((s) => s.trim().split("/")[0])
+        .filter(Boolean)
+    );
+    for (const ip of ips) {
+      const a = String(ip).trim().split("/")[0];
+      if (a) set.add(a);
+    }
+    entry.allowedIps = [...set]
+      .map((a) => (a.includes(":") ? `${a}/128` : `${a}/32`))
+      .join(",");
+  };
+  if (fs.existsSync(WG_CONF)) {
+    for (const cp of parseConfPeers(fs.readFileSync(WG_CONF, "utf8"))) {
+      const entry =
+        byKey.get(cp.publicKey) || {
+          publicKey:       cp.publicKey,
+          endpoint:        null,
+          allowedIps:      "",
+          latestHandshake: 0,
+          rx:              0,
+          tx:              0,
+          confOnly:        true,
+        };
+      mergeIps(entry, cp.allowedIps);
+      byKey.set(cp.publicKey, entry);
+    }
+  }
+  return [...byKey.values()];
+}
+
 async function stats() {
   const { peers } = await dump();
   const now       = Math.floor(Date.now() / 1_000);
@@ -561,6 +600,7 @@ module.exports = {
   addPeer,
   removePeer,
   dump,
+  knownPeers,
   stats,
   serverPubKey,
   liveInfo,

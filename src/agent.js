@@ -136,7 +136,7 @@ function routes() {
       iface:    wg.WG_IFACE,
     }),
 
-    "GET /peers": async () => (await wg.dump()).peers,
+    "GET /peers": async () => wg.knownPeers(),
 
     "GET /peers/usage": async () =>
       (await wg.dump()).peers.map((p) => ({

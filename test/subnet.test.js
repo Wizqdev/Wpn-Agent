@@ -78,3 +78,29 @@ test("subnet - falls back to the built-in default when neither is available", as
   await wg.addPeer(key(), "10.66.0.2");
   await assert.rejects(wg.addPeer(key(), "10.66.66.2"), (e) => e.status === 400);
 });
+
+test("peers - knownPeers reports conf claims hidden from the live dump", async () => {
+  const stale = key();
+  const ghost = key();
+  fs.writeFileSync(CONF,
+    `[Interface]\nAddress = 10.66.66.1/24\nPrivateKey = X\n\n` +
+    `[Peer]\nPublicKey = ${stale}\nAllowedIPs = 10.66.66.2/32, fd42:42:42::2/128\n\n` +
+    `[Peer]\nPublicKey = ${ghost}\nAllowedIPs = 10.66.66.9/32\n`,
+    { mode: 0o600 });
+  live.clear();
+  live.set(stale, "fd42:42:42::2/128");
+
+  const peers = await wg.knownPeers();
+  const merged = peers.find((p) => p.publicKey === stale);
+  assert.ok(merged.allowedIps.includes("10.66.66.2/32"));
+  assert.ok(merged.allowedIps.includes("fd42:42:42::2/128"));
+  assert.strictEqual(merged.confOnly, false);
+
+  const confPeer = peers.find((p) => p.publicKey === ghost);
+  assert.strictEqual(confPeer.allowedIps, "10.66.66.9/32");
+  assert.strictEqual(confPeer.confOnly, true);
+  assert.strictEqual(confPeer.latestHandshake, 0);
+
+  const liveOnly = (await wg.dump()).peers.find((p) => p.publicKey === stale);
+  assert.ok(!liveOnly.allowedIps.includes("10.66.66.2"));
+});
